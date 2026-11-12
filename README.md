@@ -50,9 +50,9 @@ Logs, the report and artifacts are also deleted from this repo right after the r
 
 - One `concurrency` group: a newer dispatch cancels a run that is still going.
 - Job timeout 45 minutes; the dispatcher waits up to 60.
-- The Maestro iOS driver's first start on a fresh simulator is the flakiest part of the job:
-  run `43282267102` spent 5.5 minutes preparing the runner, then the retry started it in 21 s
-  but had its runner killed by the un-reaped first session. Timeout, reaper and published
-  driver logs are the mitigation, not a guarantee.
+- The Maestro iOS driver's first start on a fresh simulator is the flakiest part of the job.
+  Measured `xcodebuild` → ready across four runs on the same image: 254 s, 330 s, 402 s, 451 s;
+  a warm start in the same job takes 21 s. 600 s of headroom, a reaper for the orphaned
+  `xcodebuild` and published driver logs are the mitigation, not a guarantee.
 - Review GitHub's Additional Product Terms before relying on this: hosted runners are meant
   for the repository's own software, and this repo only builds another repository's.

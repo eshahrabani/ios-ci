@@ -307,6 +307,7 @@ jobs:
           {
             echo "run_id: ${RUN_ID}"
             echo "correlation_id: ${CORRELATION}"
+            echo "app_repo: ${APP_REPO}"
             echo "app_sha: ${APP_SHA}"
             echo "app_ref: ${APP_REF}"
             echo "xcode: $(xcodebuild -version | tr '\n' ' ')"

@@ -314,8 +314,17 @@ jobs:
             echo "maestro_attempts: $(ls "$LOGS"/maestro-*.log 2>/dev/null | wc -l | tr -d ' ')"
           } > "$LOGS/summary.txt" 2>/dev/null || true
 
+          # Maestro's per-flow bundle can be large: one run published an 8.7 MB
+          # device-simulator.log. This branch is force-pushed every run, so keep the
+          # tail (where failures are) of any oversized file instead of the whole thing.
           mkdir -p "$LOGS/maestro"
-          if [[ -d "$ART" ]]; then cp -R "$ART"/. "$LOGS/maestro"/ 2>/dev/null || true; fi
+          if [[ -d "$ART" ]]; then
+            cp -R "$ART"/. "$LOGS/maestro"/ 2>/dev/null || true
+            find "$LOGS/maestro" -type f -size +2000k 2>/dev/null | while IFS= read -r f; do
+              tail -c 2000000 "$f" > "$f.capped" 2>/dev/null && mv "$f.capped" "$f"
+              echo "capped $(basename "$f") to its last 2 MB"
+            done
+          fi
 
           cd app || exit 0
           git config user.name "ios-ci"

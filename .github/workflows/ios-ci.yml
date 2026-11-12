@@ -50,7 +50,21 @@ jobs:
           ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
           path: app
           fetch-depth: 1
-          persist-credentials: true
+          persist-credentials: false
+
+      # actions/checkout leaves the deploy key on disk for the whole job even with
+      # persist-credentials: false. Nothing below this point needs it, and npm
+      # postinstall/build scripts are untrusted code, so remove it here and
+      # materialize it again only for the log push.
+      - name: Drop checkout credentials before running app code
+        run: |
+          set -euo pipefail
+          removed=0
+          while IFS= read -r key; do
+            rm -f "$key"
+            removed=$((removed + 1))
+          done < <(grep -l -- 'PRIVATE KEY' "$RUNNER_TEMP"/* 2>/dev/null || true)
+          echo "removed ${removed} key file(s) from RUNNER_TEMP"
 
       - name: Select Xcode
         run: |
@@ -136,7 +150,10 @@ jobs:
           fi
           UDID=${DEVICE##* }
           echo "simulator: ${DEVICE% *}"
-          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          {
+            echo "UDID=$UDID"
+            echo "SIMULATOR=${DEVICE% *}"
+          } >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID" 2>/dev/null || true
           BOOTED=0
           for _ in $(seq 1 270); do
@@ -162,45 +179,127 @@ jobs:
           curl -fsSL "https://get.maestro.mobile.dev" | bash
           echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
 
+      # The XCTest driver's first start on a fresh simulator is the flakiest part of
+      # this job: one run waited out the 300 s MAESTRO_DRIVER_STARTUP_TIMEOUT and the
+      # next run on the same image started in well under it. A driver that never opens
+      # its port is an environment failure, not a product failure, so retry that
+      # signature once. Assertion failures fail immediately and are never retried.
       - name: Run Maestro smoke test
         working-directory: app
-        timeout-minutes: 15
+        timeout-minutes: 20
         env:
           SMOKE_TEXT: ${{ inputs.smoke_text }}
           MAESTRO_DRIVER_STARTUP_TIMEOUT: 300000
+          MAESTRO_CLI_NO_ANALYTICS: "1"
         run: |
           set -euo pipefail
           export PATH="$HOME/.maestro/bin:$PATH"
-          maestro --device="$UDID" test \
-            -e APP_ID="$BUNDLE_ID" \
-            -e SMOKE_TEXT="$SMOKE_TEXT" \
-            --format junit \
-            --output "$RUNNER_TEMP/ci-logs/maestro.xml" \
-            --test-output-dir "$RUNNER_TEMP/ci-artifacts" \
-            .maestro/ > "$RUNNER_TEMP/ci-logs/maestro.log" 2>&1 || {
-              echo "Maestro smoke test failed"
-              if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then
-                cat "$RUNNER_TEMP/ci-logs/maestro.log"
-                cat "$RUNNER_TEMP/ci-logs/maestro.xml" 2>/dev/null || true
+          LOGS="$RUNNER_TEMP/ci-logs"
+          ART="$RUNNER_TEMP/ci-artifacts"
+          mkdir -p "$LOGS" "$ART"
+          DRIVER_FAILURE='iOS driver not ready in time|IOSDriverTimeoutException|Failed to connect to'
+          # The CLI's own debug log (~/.maestro/**/maestro.log) holds the driver's
+          # xcodebuild output, which is the only place a stalled driver start explains
+          # itself. Keep the three most recent, capped per file.
+          capture_maestro_logs() {
+            local attempt="$1" i=0 f files
+            files=$(find "$HOME/.maestro" -name maestro.log -type f 2>/dev/null | head -n 50 || true)
+            [[ -n "$files" ]] || return 0
+            while IFS= read -r f; do
+              i=$((i + 1))
+              tail -c 2000000 "$f" > "$LOGS/maestro-cli-${attempt}-${i}.log" 2>/dev/null || true
+            done < <(printf '%s\n' "$files" | xargs ls -t 2>/dev/null | head -n 3)
+            echo "captured ${i} Maestro CLI log(s) for attempt ${attempt}"
+          }
+          for attempt in 1 2; do
+            echo "Maestro attempt ${attempt}/2"
+            # bash 3.2 (macOS /bin/bash) treats an empty array as unset under set -u,
+            # so the optional flag is a plain variable expanded only when set.
+            driver_flag=""
+            if [[ "$attempt" -gt 1 ]]; then driver_flag="--reinstall-driver"; fi
+            if maestro --device="$UDID" test \
+              -e APP_ID="$BUNDLE_ID" \
+              -e SMOKE_TEXT="$SMOKE_TEXT" \
+              --no-ansi \
+              --format junit \
+              --output "$LOGS/maestro-${attempt}.xml" \
+              --test-output-dir "$ART/attempt-${attempt}" \
+              --debug-output "$ART/debug-${attempt}" \
+              --flatten-debug-output \
+              ${driver_flag:+"$driver_flag"} \
+              .maestro/ > "$LOGS/maestro-${attempt}.log" 2>&1; then
+              capture_maestro_logs "$attempt"
+              cp "$LOGS/maestro-${attempt}.log" "$LOGS/maestro.log"
+              if [[ -f "$LOGS/maestro-${attempt}.xml" ]]; then
+                cp "$LOGS/maestro-${attempt}.xml" "$LOGS/maestro.xml"
               fi
-              exit 1
-            }
+              exit 0
+            fi
+            capture_maestro_logs "$attempt"
+            cp "$LOGS/maestro-${attempt}.log" "$LOGS/maestro.log"
+            if [[ "$attempt" -eq 1 ]] && grep -qE "$DRIVER_FAILURE" "$LOGS/maestro-${attempt}.log"; then
+              echo "Maestro iOS driver did not start; retrying once"
+              continue
+            fi
+            echo "Maestro smoke test failed"
+            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then
+              tail -n 200 "$LOGS/maestro-${attempt}.log"
+              cat "$LOGS/maestro-${attempt}.xml" 2>/dev/null || true
+            fi
+            exit 1
+          done
+          echo "Maestro smoke test did not run"
+          exit 1
 
       - name: Publish logs to private repo
         if: always()
         env:
           RUN_ID: ${{ github.run_id }}
+          CORRELATION: ${{ inputs.correlation_id }}
+          APP_SHA: ${{ inputs.sha }}
+          APP_REF: ${{ inputs.ref }}
+          APP_REPO: ${{ secrets.APP_REPO }}
+          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
         run: |
           set -uo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          ART="$RUNNER_TEMP/ci-artifacts"
+          [[ -d "$LOGS" ]] || { echo "no logs to publish"; exit 0; }
+          [[ -d app ]] || { echo "warning: app checkout missing; nothing to publish"; exit 0; }
+          [[ -n "${APP_DEPLOY_KEY:-}" ]] || { echo "warning: APP_DEPLOY_KEY is not set"; exit 0; }
+
+          # The deploy key is materialized only here: the build steps run app code and
+          # must not be able to reach a key that can write this repository.
+          KEY="$RUNNER_TEMP/publish_key"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/publish_known_hosts"
+
+          {
+            echo "run_id: ${RUN_ID}"
+            echo "correlation_id: ${CORRELATION}"
+            echo "app_sha: ${APP_SHA}"
+            echo "app_ref: ${APP_REF}"
+            echo "xcode: $(xcodebuild -version | tr '\n' ' ')"
+            echo "simulator: ${SIMULATOR:-unknown}"
+            echo "bundle_id: ${BUNDLE_ID:-unknown}"
+            echo "maestro_attempts: $(ls "$LOGS"/maestro-*.log 2>/dev/null | wc -l | tr -d ' ')"
+          } > "$LOGS/summary.txt" 2>/dev/null || true
+
+          mkdir -p "$LOGS/maestro"
+          if [[ -d "$ART" ]]; then cp -R "$ART"/. "$LOGS/maestro"/ 2>/dev/null || true; fi
+
           cd app || exit 0
-          [[ -d "$RUNNER_TEMP/ci-logs" ]] || exit 0
           git config user.name "ios-ci"
           git config user.email "ios-ci@users.noreply.github.com"
-          git checkout --orphan "ci-logs-${RUN_ID}" >/dev/null 2>&1 || true
+          git checkout --orphan "ci-logs-${RUN_ID}" >/dev/null 2>&1 \
+            || git checkout -B "ci-logs-${RUN_ID}" >/dev/null 2>&1 || true
           git rm -rf . >/dev/null 2>&1 || true
           mkdir -p ci-logs
-          cp -R "$RUNNER_TEMP/ci-logs"/. ci-logs/ 2>/dev/null || true
-          git add ci-logs >/dev/null 2>&1 || true
-          git commit -m "CI logs ${RUN_ID}" >/dev/null 2>&1 || exit 0
-          git push --force origin "HEAD:refs/heads/ci-logs" >/dev/null 2>&1 \
+          cp -R "$LOGS"/. ci-logs/ 2>/dev/null || true
+          git add -A ci-logs >/dev/null 2>&1 || true
+          git commit -m "CI logs ${RUN_ID} (${CORRELATION})" >/dev/null 2>&1 \
+            || { echo "warning: nothing to commit"; exit 0; }
+          git push --force "git@github.com:${APP_REPO}.git" "HEAD:refs/heads/ci-logs" \
             || echo "warning: could not publish logs"

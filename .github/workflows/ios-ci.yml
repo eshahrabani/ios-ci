@@ -179,17 +179,23 @@ jobs:
           curl -fsSL "https://get.maestro.mobile.dev" | bash
           echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
 
-      # The XCTest driver's first start on a fresh simulator is the flakiest part of
-      # this job: one run waited out the 300 s MAESTRO_DRIVER_STARTUP_TIMEOUT and the
-      # next run on the same image started in well under it. A driver that never opens
-      # its port is an environment failure, not a product failure, so retry that
-      # signature once. Assertion failures fail immediately and are never retried.
+      # Measured on macos-26 + Xcode 26.6: the first XCTest driver start on a fresh
+      # simulator spent 5.5 minutes inside `xcodebuild test-without-building` before the
+      # runner even launched (18:44:44 -> 18:50:10), so the 300 s limit fired too early;
+      # the second start took 21 s. Give the first attempt 480 s. A driver that still
+      # never opens its port is an environment failure, not a product failure, so retry
+      # that signature once. Assertion failures fail immediately and are never retried.
+      #
+      # A timed-out attempt leaves its `xcodebuild` running, and it relaunches the runner
+      # on its own ("Restarting after unexpected exit, crash, or test timeout"). Observed:
+      # attempt 1 respawned a runner at 18:51:59 while attempt 2 was serving requests, and
+      # attempt 2's runner died with `ConnectException` on its port. Two XCTest sessions on
+      # one simulator kill each other, so reap them between attempts.
       - name: Run Maestro smoke test
         working-directory: app
         timeout-minutes: 20
         env:
           SMOKE_TEXT: ${{ inputs.smoke_text }}
-          MAESTRO_DRIVER_STARTUP_TIMEOUT: 300000
           MAESTRO_CLI_NO_ANALYTICS: "1"
         run: |
           set -euo pipefail
@@ -211,13 +217,31 @@ jobs:
             done < <(printf '%s\n' "$files" | xargs ls -t 2>/dev/null | head -n 3)
             echo "captured ${i} Maestro CLI log(s) for attempt ${attempt}"
           }
+          kill_stale_xctest() {
+            local pids
+            pids=$(pgrep -f 'maestro-driver-iosUITests' 2>/dev/null || true)
+            if [[ -z "$pids" ]]; then
+              echo "no stale xctest processes"
+              return 0
+            fi
+            echo "killing stale xctest processes: $(echo "$pids" | tr '\n' ' ')"
+            # shellcheck disable=SC2086
+            kill -9 $pids 2>/dev/null || true
+            sleep 2
+            echo "remaining: $(pgrep -f 'maestro-driver-iosUITests' 2>/dev/null | tr '\n' ' ')"
+          }
           for attempt in 1 2; do
             echo "Maestro attempt ${attempt}/2"
             # bash 3.2 (macOS /bin/bash) treats an empty array as unset under set -u,
-            # so the optional flag is a plain variable expanded only when set.
+            # so optional arguments are plain variables expanded only when set.
             driver_flag=""
-            if [[ "$attempt" -gt 1 ]]; then driver_flag="--reinstall-driver"; fi
-            if maestro --device="$UDID" test \
+            driver_timeout=480000
+            if [[ "$attempt" -gt 1 ]]; then
+              driver_flag="--reinstall-driver"
+              driver_timeout=300000
+            fi
+            if MAESTRO_DRIVER_STARTUP_TIMEOUT="$driver_timeout" \
+              maestro --device="$UDID" test \
               -e APP_ID="$BUNDLE_ID" \
               -e SMOKE_TEXT="$SMOKE_TEXT" \
               --no-ansi \
@@ -233,12 +257,14 @@ jobs:
               if [[ -f "$LOGS/maestro-${attempt}.xml" ]]; then
                 cp "$LOGS/maestro-${attempt}.xml" "$LOGS/maestro.xml"
               fi
+              kill_stale_xctest
               exit 0
             fi
             capture_maestro_logs "$attempt"
             cp "$LOGS/maestro-${attempt}.log" "$LOGS/maestro.log"
             if [[ "$attempt" -eq 1 ]] && grep -qE "$DRIVER_FAILURE" "$LOGS/maestro-${attempt}.log"; then
-              echo "Maestro iOS driver did not start; retrying once"
+              echo "Maestro iOS driver did not start; reaping and retrying once"
+              kill_stale_xctest
               continue
             fi
             echo "Maestro smoke test failed"
@@ -246,6 +272,7 @@ jobs:
               tail -n 200 "$LOGS/maestro-${attempt}.log"
               cat "$LOGS/maestro-${attempt}.xml" 2>/dev/null || true
             fi
+            kill_stale_xctest
             exit 1
           done
           echo "Maestro smoke test did not run"

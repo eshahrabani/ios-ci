@@ -40,7 +40,10 @@ project (created with `cap add ios` if absent), and `.maestro/` flows using `${A
    the attempt is retried once with 300 s. Assertion failures are never retried. 20-minute step
    cap.
 5. Always: force-push `ci-logs` to the app repo with `xcodebuild.log`, `maestro-N.log`,
-   `maestro.xml`, Maestro's `--debug-output`/`--test-output-dir` trees and a `summary.txt`.
+   `maestro.xml`, Maestro's `--debug-output`/`--test-output-dir` trees, a `summary.txt`, and a
+   branch-root `README.md` that renders the flow's screenshots inline and links its recording —
+   the only way to see a headless run. Logs over 2 MB are truncated to their tail; `.png`/`.mp4`
+   media never is.
 
 No build output, test text or app source is printed publicly unless `debug_public_logs=true`.
 Logs, the report and artifacts are also deleted from this repo right after the run by
@@ -48,6 +51,9 @@ Logs, the report and artifacts are also deleted from this repo right after the r
 
 ## Limits
 
+- There is no live view of the simulator on a hosted runner: no display, no interactive
+  session. Screenshots/recording published to `ci-logs` are the substitute; a self-hosted macOS
+  runner or Maestro Cloud is the only way to watch in real time.
 - One `concurrency` group: a newer dispatch cancels a run that is still going.
 - Job timeout 45 minutes; the dispatcher waits up to 60.
 - The Maestro iOS driver's first start on a fresh simulator is the flakiest part of the job.

@@ -138,7 +138,16 @@ jobs:
           echo "simulator: ${DEVICE% *}"
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID" 2>/dev/null || true
-          xcrun simctl bootstatus "$UDID" -b
+          BOOTED=0
+          for _ in $(seq 1 90); do
+            if xcrun simctl list devices | grep -q "($UDID) (Booted)"; then BOOTED=1; break; fi
+            sleep 2
+          done
+          if [[ "$BOOTED" != "1" ]]; then
+            echo "simulator $UDID did not reach Booted within 180s"
+            xcrun simctl list devices available | head -30
+            exit 1
+          fi
           APP_PATH=$(find "$RUNNER_TEMP/DerivedData/Build/Products/Debug-iphonesimulator" \
             -maxdepth 1 -name 'App.app' | head -n1)
           if [[ -z "$APP_PATH" ]]; then echo "built .app not found"; exit 1; fi

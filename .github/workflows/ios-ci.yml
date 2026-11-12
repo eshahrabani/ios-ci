@@ -1,0 +1,185 @@
+name: ios-ci
+run-name: ios-ci ${{ inputs.correlation_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit SHA in the private app repository
+        required: true
+        type: string
+      ref:
+        description: Private branch/tag name (diagnostics only)
+        required: false
+        default: main
+        type: string
+      correlation_id:
+        description: Unique ID used by the private repo to find this run
+        required: true
+        type: string
+      smoke_text:
+        description: Text visible on the app's first screen
+        required: true
+        type: string
+      debug_public_logs:
+        description: Print raw app build/test output to the public log
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-ci
+  cancel-in-progress: true
+
+jobs:
+  ios:
+    name: ios-simulator
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      DEBUG_PUBLIC_LOGS: ${{ inputs.debug_public_logs }}
+      SMOKE_TEXT: ${{ inputs.smoke_text }}
+    steps:
+      - name: Checkout private app
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ secrets.APP_REPO }}
+          ref: ${{ inputs.sha }}
+          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
+          path: app
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Select Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app
+          xcodebuild -version
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: app
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ci-logs"
+          npm ci > "$RUNNER_TEMP/ci-logs/npm-ci.log" 2>&1 || {
+            echo "npm ci failed"
+            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/npm-ci.log"; fi
+            exit 1
+          }
+
+      - name: Build web assets
+        working-directory: app
+        run: |
+          set -euo pipefail
+          npm run build > "$RUNNER_TEMP/ci-logs/npm-build.log" 2>&1 || {
+            echo "web build failed"
+            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/npm-build.log"; fi
+            exit 1
+          }
+
+      - name: Sync Capacitor iOS project
+        working-directory: app
+        run: |
+          set -euo pipefail
+          if [[ ! -d ios/App ]]; then npx cap add ios; fi
+          npx cap sync ios > "$RUNNER_TEMP/ci-logs/cap-sync.log" 2>&1 || {
+            echo "cap sync failed"
+            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/cap-sync.log"; fi
+            exit 1
+          }
+
+      - name: Build for iOS Simulator
+        working-directory: app
+        run: |
+          set -euo pipefail
+          if [[ -d ios/App/App.xcworkspace ]]; then
+            PROJECT=(-workspace ios/App/App.xcworkspace)
+          else
+            PROJECT=(-project ios/App/App.xcodeproj)
+          fi
+          xcodebuild "${PROJECT[@]}" \
+            -scheme App \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination "platform=iOS Simulator,name=iPhone 17,OS=latest" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build > "$RUNNER_TEMP/ci-logs/xcodebuild.log" 2>&1 || {
+              echo "xcodebuild failed"
+              if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/xcodebuild.log"; fi
+              exit 1
+            }
+
+      - name: Boot simulator and install app
+        working-directory: app
+        run: |
+          set -euo pipefail
+          UDID=$(xcrun simctl list devices available -j | jq -r --arg name "iPhone 17" '
+            [.devices | to_entries[] | .key as $runtime | .value[]
+             | select(.name == $name) | {runtime: $runtime, udid: .udid}]
+            | sort_by(.runtime) | last | .udid')
+          if [[ -z "$UDID" || "$UDID" == "null" ]]; then
+            echo "iPhone 17 simulator not found"; exit 1
+          fi
+          echo "UDID=$UDID" >> "$GITHUB_ENV"
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$UDID" -b
+          APP_PATH=$(find "$RUNNER_TEMP/DerivedData/Build/Products/Debug-iphonesimulator" \
+            -maxdepth 1 -name 'App.app' | head -n1)
+          if [[ -z "$APP_PATH" ]]; then echo "built .app not found"; exit 1; fi
+          xcrun simctl install "$UDID" "$APP_PATH"
+          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
+          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+
+      - name: Install Maestro
+        run: |
+          curl -fsSL "https://get.maestro.mobile.dev" | bash
+          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
+
+      - name: Run Maestro smoke test
+        working-directory: app
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.maestro/bin:$PATH"
+          maestro --device="$UDID" test \
+            -e APP_ID="$BUNDLE_ID" \
+            -e SMOKE_TEXT="$SMOKE_TEXT" \
+            --format junit \
+            --output "$RUNNER_TEMP/ci-logs/maestro.xml" \
+            --test-output-dir "$RUNNER_TEMP/ci-artifacts" \
+            .maestro/ > "$RUNNER_TEMP/ci-logs/maestro.log" 2>&1 || {
+              echo "Maestro smoke test failed"
+              if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then
+                cat "$RUNNER_TEMP/ci-logs/maestro.log"
+                cat "$RUNNER_TEMP/ci-logs/maestro.xml" 2>/dev/null || true
+              fi
+              exit 1
+            }
+
+      - name: Publish logs to private repo
+        if: always()
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          cd app || exit 0
+          [[ -d "$RUNNER_TEMP/ci-logs" ]] || exit 0
+          git config user.name "ios-ci"
+          git config user.email "ios-ci@users.noreply.github.com"
+          git checkout --orphan "ci-logs-${RUN_ID}" >/dev/null 2>&1 || true
+          git rm -rf . >/dev/null 2>&1 || true
+          mkdir -p ci-logs
+          cp -R "$RUNNER_TEMP/ci-logs"/. ci-logs/ 2>/dev/null || true
+          git add ci-logs >/dev/null 2>&1 || true
+          git commit -m "CI logs ${RUN_ID}" >/dev/null 2>&1 || exit 0
+          git push --force origin "HEAD:refs/heads/ci-logs" >/dev/null 2>&1 \
+            || echo "warning: could not publish logs"

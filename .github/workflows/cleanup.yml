@@ -1,0 +1,29 @@
+name: ios-ci-cleanup
+
+on:
+  workflow_run:
+    workflows: ["ios-ci"]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  delete-logs:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Delete logs and artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -uo pipefail
+          gh api -X DELETE "/repos/${REPO}/actions/runs/${RUN_ID}/logs" \
+            >/dev/null 2>&1 || true
+          gh api "/repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[].id' 2>/dev/null \
+            | while read -r id; do
+                gh api -X DELETE "/repos/${REPO}/actions/artifacts/${id}" \
+                  >/dev/null 2>&1 || true
+              done

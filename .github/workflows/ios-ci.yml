@@ -179,10 +179,10 @@ jobs:
           curl -fsSL "https://get.maestro.mobile.dev" | bash
           echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
 
-      # Measured on macos-26 + Xcode 26.6: the first XCTest driver start on a fresh
-      # simulator spent 5.5 minutes inside `xcodebuild test-without-building` before the
-      # runner even launched (18:44:44 -> 18:50:10), so the 300 s limit fired too early;
-      # the second start took 21 s. Give the first attempt 480 s. A driver that still
+      # Measured on macos-26 + Xcode 26.6, first XCTest driver start on a fresh simulator,
+      # time from `xcodebuild test-without-building` to a live runner: 254 s, 330 s (the run
+      # that failed at 300 s), 451 s. The spread is wide and the tail matters, so the first
+      # attempt gets 600 s; a warm second start takes 21 s. A driver that still
       # never opens its port is an environment failure, not a product failure, so retry
       # that signature once. Assertion failures fail immediately and are never retried.
       #
@@ -190,7 +190,8 @@ jobs:
       # on its own ("Restarting after unexpected exit, crash, or test timeout"). Observed:
       # attempt 1 respawned a runner at 18:51:59 while attempt 2 was serving requests, and
       # attempt 2's runner died with `ConnectException` on its port. Two XCTest sessions on
-      # one simulator kill each other, so reap them between attempts.
+      # one simulator kill each other, so reap them between attempts. Worst case is
+      # 600 + 300 s, and the 20-minute step cap still holds.
       - name: Run Maestro smoke test
         working-directory: app
         timeout-minutes: 20
@@ -235,7 +236,7 @@ jobs:
             # bash 3.2 (macOS /bin/bash) treats an empty array as unset under set -u,
             # so optional arguments are plain variables expanded only when set.
             driver_flag=""
-            driver_timeout=480000
+            driver_timeout=600000
             if [[ "$attempt" -gt 1 ]]; then
               driver_flag="--reinstall-driver"
               driver_timeout=300000

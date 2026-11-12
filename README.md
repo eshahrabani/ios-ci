@@ -49,6 +49,35 @@ No build output, test text or app source is printed publicly unless `debug_publi
 Logs, the report and artifacts are also deleted from this repo right after the run by
 `cleanup.yml`, so retention never applies.
 
+## Running another Capacitor app
+
+`bin/ios-ci.sh` drives the pipeline from your machine:
+
+```bash
+bin/ios-ci.sh prepare   ~/git/my-app     # add .maestro/smoke.yaml if it has no flows
+bin/ios-ci.sh configure ~/git/my-app     # install a write deploy key, set APP_REPO/APP_DEPLOY_KEY
+bin/ios-ci.sh run       ~/git/my-app --smoke-text "Welcome"
+```
+
+`run` dispatches on the app's current HEAD, waits (60 min default), downloads the `ci-logs`
+branch into `./ci-run-<id>/` (README, screenshot, recording, all logs), prints attempts, flow
+result and media paths, and exits non-zero if the run fails. `--dry-run` prints the dispatch
+without calling GitHub; `--debug-logs` also publishes raw build output; `--out DIR`, `--ref`,
+`--timeout` and `--runner` override the defaults.
+
+Requirements: `git`, `jq`, and `gh` authenticated for both repositories; admin rights on the app
+repo (to install the deploy key) and on this repo (to set its secrets).
+
+Notes:
+
+- **One app at a time.** `APP_REPO`/`APP_DEPLOY_KEY` are single-valued secrets, so `configure`
+  retargets the pipeline rather than adding a target. `run` reads `app_repo` out of the
+  published `summary.txt` and warns if the runner built some other repository.
+- **`--smoke-text`** is required when a flow asserts `${SMOKE_TEXT}`; otherwise it falls back to
+  the app repo's `SMOKE_TEXT` variable, and `prepare`'s generic flow asserts no text at all.
+- App Store delivery is *not* part of this: the app repo's `testflight.yml` is separate,
+  untested, and needs App Store Connect credentials.
+
 ## Limits
 
 - There is no live view of the simulator on a hosted runner: no display, no interactive

@@ -109,7 +109,7 @@ jobs:
             -scheme App \
             -configuration Debug \
             -sdk iphonesimulator \
-            -destination "platform=iOS Simulator,name=iPhone 17,OS=latest" \
+            -destination "generic/platform=iOS Simulator" \
             -derivedDataPath "$RUNNER_TEMP/DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
             build > "$RUNNER_TEMP/ci-logs/xcodebuild.log" 2>&1 || {
@@ -123,13 +123,19 @@ jobs:
         timeout-minutes: 10
         run: |
           set -euo pipefail
-          UDID=$(xcrun simctl list devices available -j | jq -r --arg name "iPhone 17" '
+          DEVICE=$(xcrun simctl list devices available -j | jq -r '
             [.devices | to_entries[] | .key as $runtime | .value[]
-             | select(.name == $name) | {runtime: $runtime, udid: .udid}]
-            | sort_by(.runtime) | last | .udid')
-          if [[ -z "$UDID" || "$UDID" == "null" ]]; then
-            echo "iPhone 17 simulator not found"; exit 1
+             | select(.name | test("^iPhone")) | {runtime: $runtime, name: .name, udid: .udid}]
+            | (map(select(.name == "iPhone 17")) | sort_by(.runtime) | last)
+              // (sort_by(.runtime) | last)
+            | "\(.name) \(.udid)"')
+          if [[ -z "$DEVICE" || "$DEVICE" == "null"* ]]; then
+            echo "no iPhone simulator found"
+            xcrun simctl list devices available | head -30
+            exit 1
           fi
+          UDID=${DEVICE##* }
+          echo "simulator: ${DEVICE% *}"
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID" 2>/dev/null || true
           xcrun simctl bootstatus "$UDID" -b

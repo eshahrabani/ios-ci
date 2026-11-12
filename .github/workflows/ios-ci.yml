@@ -167,6 +167,7 @@ jobs:
         timeout-minutes: 15
         env:
           SMOKE_TEXT: ${{ inputs.smoke_text }}
+          MAESTRO_DRIVER_STARTUP_TIMEOUT: 300000
         run: |
           set -euo pipefail
           export PATH="$HOME/.maestro/bin:$PATH"

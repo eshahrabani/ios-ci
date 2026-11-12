@@ -41,7 +41,6 @@ jobs:
     timeout-minutes: 45
     env:
       DEBUG_PUBLIC_LOGS: ${{ inputs.debug_public_logs }}
-      SMOKE_TEXT: ${{ inputs.smoke_text }}
     steps:
       - name: Checkout private app
         uses: actions/checkout@v7
@@ -149,6 +148,8 @@ jobs:
 
       - name: Run Maestro smoke test
         working-directory: app
+        env:
+          SMOKE_TEXT: ${{ inputs.smoke_text }}
         run: |
           set -euo pipefail
           export PATH="$HOME/.maestro/bin:$PATH"

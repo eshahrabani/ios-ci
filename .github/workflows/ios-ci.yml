@@ -139,12 +139,12 @@ jobs:
           echo "UDID=$UDID" >> "$GITHUB_ENV"
           xcrun simctl boot "$UDID" 2>/dev/null || true
           BOOTED=0
-          for _ in $(seq 1 90); do
+          for _ in $(seq 1 270); do
             if xcrun simctl list devices | grep -q "($UDID) (Booted)"; then BOOTED=1; break; fi
             sleep 2
           done
           if [[ "$BOOTED" != "1" ]]; then
-            echo "simulator $UDID did not reach Booted within 180s"
+            echo "simulator $UDID did not reach Booted within 540s"
             xcrun simctl list devices available | head -30
             exit 1
           fi

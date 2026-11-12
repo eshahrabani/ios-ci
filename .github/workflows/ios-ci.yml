@@ -315,16 +315,24 @@ jobs:
             echo "maestro_attempts: $(ls "$LOGS"/maestro-*.log 2>/dev/null | wc -l | tr -d ' ')"
           } > "$LOGS/summary.txt" 2>/dev/null || true
 
-          # Maestro's per-flow bundle can be large: one run published an 8.7 MB
-          # device-simulator.log. This branch is force-pushed every run, so keep the
-          # tail (where failures are) of any oversized file instead of the whole thing.
+          # Maestro's per-flow bundle can be large: one run published a 33 MB
+          # device-simulator.log. This branch is force-pushed every run, so text logs
+          # keep only their tail (where failures are). Screenshots and recordings are
+          # never truncated: a cut PNG or MP4 is corrupt, and they are the only way to
+          # see a headless run.
           mkdir -p "$LOGS/maestro"
           if [[ -d "$ART" ]]; then
             cp -R "$ART"/. "$LOGS/maestro"/ 2>/dev/null || true
-            find "$LOGS/maestro" -type f -size +2000k 2>/dev/null | while IFS= read -r f; do
-              tail -c 2000000 "$f" > "$f.capped" 2>/dev/null && mv "$f.capped" "$f"
-              echo "capped $(basename "$f") to its last 2 MB"
-            done
+            find "$LOGS/maestro" -type f -size +2000k \
+                 ! -name '*.png' ! -name '*.jpg' ! -name '*.mp4' ! -name '*.mov' 2>/dev/null \
+              | while IFS= read -r f; do
+                  tail -c 2000000 "$f" > "$f.capped" 2>/dev/null && mv "$f.capped" "$f"
+                  echo "capped $(basename "$f") to its last 2 MB"
+                done
+            find "$LOGS/maestro" -type f \( -name '*.png' -o -name '*.jpg' -o -name '*.mp4' -o -name '*.mov' \) \
+              -exec ls -l {} \; 2>/dev/null | while IFS= read -r line; do
+                echo "media: $(echo "$line" | awk '{print $5" bytes  "$9}')"
+              done
           fi
 
           cd app || exit 0
@@ -335,7 +343,30 @@ jobs:
           git rm -rf . >/dev/null 2>&1 || true
           mkdir -p ci-logs
           cp -R "$LOGS"/. ci-logs/ 2>/dev/null || true
-          git add -A ci-logs >/dev/null 2>&1 || true
+          # A branch-root README renders the run's screenshots inline and links the
+          # recording, so viewing a headless run is one click instead of a file hunt.
+          {
+            echo "# ios-ci run ${RUN_ID}"
+            echo
+            echo "correlation \`${CORRELATION}\`, app \`${APP_SHA}\` (${APP_REF}), ${SIMULATOR:-unknown simulator}."
+            echo
+            shown=0
+            for img in $(find ci-logs -type f \( -name '*.png' -o -name '*.jpg' \) 2>/dev/null | sort | head -n 6); do
+              shown=$((shown + 1))
+              echo "![screenshot ${shown}](${img})"
+              echo
+            done
+            if [[ "$shown" -eq 0 ]]; then
+              echo "_No screenshot in this run: the flow only captures one where it calls \`takeScreenshot\`._"
+              echo
+            fi
+            for vid in $(find ci-logs -type f \( -name '*.mp4' -o -name '*.mov' \) 2>/dev/null | sort | head -n 3); do
+              echo "[Recording: $(basename "$vid")](${vid})"
+              echo
+            done
+            echo "Raw logs: \`ci-logs/\` — \`summary.txt\`, per-attempt \`maestro-N.log\`, Maestro's \`debug-N/\` bundle."
+          } > README.md
+          git add -A ci-logs README.md >/dev/null 2>&1 || true
           git commit -m "CI logs ${RUN_ID} (${CORRELATION})" >/dev/null 2>&1 \
             || { echo "warning: nothing to commit"; exit 0; }
           git push --force "git@github.com:${APP_REPO}.git" "HEAD:refs/heads/ci-logs" \

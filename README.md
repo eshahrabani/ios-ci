@@ -65,6 +65,11 @@ result and media paths, and exits non-zero if the run fails. `--dry-run` prints 
 without calling GitHub; `--debug-logs` also publishes raw build output; `--out DIR`, `--ref`,
 `--timeout` and `--runner` override the defaults.
 
+`run` preflights before dispatching, so a missing prerequisite fails in a second instead of
+ten minutes into a macOS job: no `build` script in `package.json` is fatal, and an unpushed
+`HEAD` or a missing `@capacitor/cli` produces a warning. It also accepts a worktree (`.git`
+as a file).
+
 Requirements: `git`, `jq`, and `gh` authenticated for both repositories; admin rights on the app
 repo (to install the deploy key) and on this repo (to set its secrets).
 

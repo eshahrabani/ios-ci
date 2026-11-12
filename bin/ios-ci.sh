@@ -91,7 +91,23 @@ resolve_app_dir() {
   APP_DIR="${1:-.}"
   [[ -d "$APP_DIR" ]] || die "not a directory: $APP_DIR"
   APP_DIR=$(cd "$APP_DIR" && pwd)
-  [[ -d "$APP_DIR/.git" ]] || die "$APP_DIR is not a git repository"
+  git -C "$APP_DIR" rev-parse --git-dir >/dev/null 2>&1 || die "$APP_DIR is not a git repository"
+}
+
+# The runner hard-codes `npm run build`, `npx cap sync ios` and a checkout of $SHA.
+# Anything missing here fails inside a ten-minute macOS job; check it first.
+preflight() {
+  local build_ok=false cap_ok=false
+  if [[ -f "$APP_DIR/package.json" ]]; then
+    [[ "$(jq -r '.scripts.build // empty' "$APP_DIR/package.json")" != "" ]] && build_ok=true
+    [[ "$(jq -r '(.dependencies // {}) + (.devDependencies // {}) | has("@capacitor/cli")' "$APP_DIR/package.json")" == "true" ]] && cap_ok=true
+  fi
+  [[ "$build_ok" == true ]] || die "package.json has no \"build\" script; the runner runs 'npm run build'"
+  [[ "$cap_ok" == true ]] || warn "@capacitor/cli is not a dependency; the runner's 'npx cap sync ios' will try to fetch it"
+  if [[ -z "$(git -C "$APP_DIR" branch -r --contains HEAD 2>/dev/null)" ]]; then
+    warn "HEAD ($(git -C "$APP_DIR" rev-parse --short HEAD)) is not on any remote-tracking branch;
+     push it first or the private checkout will fail"
+  fi
 }
 
 current_branch() {
@@ -189,6 +205,7 @@ cmd_configure() {
 
 cmd_run() {
   resolve_app_dir "$1"
+  preflight
   local app sha export_ref text
   app=$(app_repo_of) || exit 2
   [[ -n "$app" ]] || die "could not derive OWNER/NAME from $APP_DIR's origin remote"

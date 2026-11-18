@@ -139,19 +139,25 @@ jobs:
 
           # install-system-daemon returns before the socket answers; `up` would fail
           # with "failed to connect to local tailscaled" if it ran immediately.
-          for _ in $(seq 1 30); do
+          for i in $(seq 1 30); do
             if "$TS_PREFIX/bin/tailscale" status --json 2>/dev/null | jq -e . >/dev/null 2>&1; then
-              echo "daemon ready after ${_}s" | tee -a "$LOG"
+              echo "daemon ready after ${i}s" | tee -a "$LOG"
               break
             fi
             sleep 1
           done
 
           # `up` has no --ephemeral flag: ephemerality is a property of the auth key.
-          step sudo "$TS_PREFIX/bin/tailscale" up \
+          if ! step sudo "$TS_PREFIX/bin/tailscale" up \
             --authkey="$TAILSCALE_AUTH_KEY" \
             --hostname="ios-ci-${RUN_ID}" \
-            --timeout=120s
+            --timeout=120s; then
+            if grep -q 'invalid key' "$LOG"; then
+              echo "TAILSCALE_AUTH_KEY was rejected: paste a reusable auth key (tskey-auth-…),"
+              echo "not an OAuth client secret, from https://login.tailscale.com/admin/settings/keys"
+            fi
+            exit 1
+          fi
           "$TS_PREFIX/bin/tailscale" status 2>&1 | tee -a "$LOG" || true
 
       - name: Select Xcode

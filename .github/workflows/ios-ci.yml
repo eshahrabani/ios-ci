@@ -386,19 +386,40 @@ jobs:
           # so its password cannot be set. The credential that works is an account
           # password via Apple auth (type 30), so create a dedicated admin account and
           # prove it accepts the secret before publishing an address.
-          VNC_USER=tester
-          # These can decide to prompt and block forever; stdin is closed so a prompt
-          # fails fast. Do not use `timeout`: macOS ships no such command (exit 127).
-          if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
-            if ! sudo sysadminctl -addUser "$VNC_USER" \
-                -fullName "iOS CI tester" -password "$VNC_USER_PASSWORD" -admin </dev/null; then
-              echo "could not create the ${VNC_USER} account"
-              exit 1
+          # Screen Sharing attaches to the console session. Authenticating as any other
+          # account makes macOS create a second session, and the tester sees black while
+          # its WindowServer starts (measured: console user runner, auth as tester, then
+          # a blank framebuffer and a dropped connection). The account that works is the
+          # one that owns /dev/console, so give it a known password; fall back to a
+          # dedicated account only if that is impossible.
+          # Do not use `timeout`: macOS ships no such command (exit 127). Stdin is
+          # closed so a prompting command fails fast instead of blocking.
+          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
+          echo "console user: ${CONSOLE_USER}"
+          VNC_USER=""
+          if [[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]]; then
+            sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" \
+              -newPassword "$VNC_USER_PASSWORD" </dev/null 2>&1 || true
+            if dscl . -authonly "$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
+              VNC_USER="$CONSOLE_USER"
+              echo "${VNC_USER} (the console user) accepts VNC_USER_PASSWORD"
+            else
+              echo "could not set the console user's password; falling back to tester"
             fi
           fi
-          if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
-            echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
-            exit 1
+          if [[ -z "$VNC_USER" ]]; then
+            VNC_USER=tester
+            if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
+              if ! sudo sysadminctl -addUser "$VNC_USER" \
+                  -fullName "iOS CI tester" -password "$VNC_USER_PASSWORD" -admin </dev/null; then
+                echo "could not create the ${VNC_USER} account"
+                exit 1
+              fi
+            fi
+            if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
+              echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
+              exit 1
+            fi
           fi
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart

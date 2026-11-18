@@ -31,7 +31,8 @@ jobs:
           echo "== processes: $(ps ax -o comm= | grep -iE 'screenshar|ARDAgent|loginwindow|WindowServer|Dock' | sort -u | tr '\n' ' ')"
           echo "== kickstart: $(ls -l /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart 2>&1)"
           echo "== screensharing plist: $(ls -l /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>&1)"
-          echo "== launchctl print:"; sudo launchctl print system/com.apple.screensharing 2>&1 | head -15
+          echo "== launchctl print:"; sudo launchctl print system/com.apple.screensharing 2>&1 | head -15 || true
+          true
 
       - name: Enable screen sharing
         run: |
@@ -51,7 +52,8 @@ jobs:
           echo '--- port 5900'; sudo lsof -iTCP:5900 -sTCP:LISTEN 2>&1 || echo 'NONE on 5900'
           echo '--- launchctl print system/com.apple.screensharing'; sudo launchctl print system/com.apple.screensharing 2>&1 | head -25
           echo '--- processes now:'; ps ax -o comm= | grep -iE 'screenshar|ARDAgent' | sort -u || true
-          echo '--- log show (10m):'; sudo log show --last 10m --predicate 'process == "screensharingd" OR eventMessage CONTAINS[c] "screensharing"' 2>&1 | tail -30
+          echo '--- log show (10m):'; sudo log show --last 10m --predicate 'process == "screensharingd" OR eventMessage CONTAINS[c] "screensharing"' 2>&1 | tail -30 || true
+          true
 
       - name: Tailscale install on the image
         run: |
@@ -65,4 +67,5 @@ jobs:
           echo '--- tailscaled install-system-daemon'
           sudo -E "$(brew --prefix)/sbin/tailscaled" install-system-daemon 2>&1 | tail -10
           echo '--- daemon status:'; sudo launchctl print system/com.tailscale.tailscaled 2>&1 | head -12
-          echo '--- tailscale status (no key):'; "$(brew --prefix)/bin/tailscale" status 2>&1 | head -5
+          echo '--- tailscale status (no key):'; "$(brew --prefix)/bin/tailscale" status 2>&1 | head -5 || true
+          true

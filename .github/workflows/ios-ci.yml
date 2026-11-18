@@ -425,6 +425,17 @@ jobs:
           # cfprefsd serves the old values until it is restarted.
           sudo killall cfprefsd 2>/dev/null || true
           sleep 2
+          # The daemon refuses to capture until it holds the Screen Recording grant;
+          # with it missing its checkin line reads screenCaptureFlag 0 and clients get
+          # a black framebuffer. The images keep that TCC database writable by root.
+          TCCDB="/Library/Application Support/com.apple.TCC/TCC.db"
+          for client in \
+            "/System/Library/CoreServices/RemoteManagement/screensharingd" \
+            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent"; do
+            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceScreenCapture','$client',1,2,0,1,0)" 2>&1 | head -2 || true
+          done
+          sudo killall tccd 2>/dev/null || true
+          sleep 1
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
           sudo "$KICKSTART" -restart -agent -console </dev/null || true
@@ -460,6 +471,8 @@ jobs:
             dscl . -read /Users/runner AuthenticationAuthority 2>&1 | head -4
             echo "== empty password probe"
             dscl . -authonly runner "" </dev/null 2>&1 || echo "empty rejected"
+            echo "== remote management prefs"
+            sudo defaults read /Library/Preferences/com.apple.RemoteManagement 2>&1 | head -6
             echo "== tcc rows"
             sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
               "select client, auth_value from access where service='kTCCServiceScreenCapture'" 2>&1 | head -6

@@ -26,6 +26,11 @@ on:
         required: false
         default: false
         type: boolean
+      manual_minutes:
+        description: Minutes to hold a VNC desktop session on the hosted runner (0 disables; max 300)
+        required: false
+        default: '0'
+        type: string
 
 permissions:
   contents: read
@@ -35,12 +40,48 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Actions expressions have no arithmetic (no `+`), and job timeout-minutes cannot
+  # read env, so the manual schedule is computed here. A manual run gets
+  # 60 + manual_minutes for the job (60 for checkout/build/Maestro/VNC setup plus the
+  # hold) and manual_minutes + 10 for the hold step. Normal runs keep 45.
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      job_timeout: ${{ steps.compute.outputs.job_timeout }}
+      hold_timeout: ${{ steps.compute.outputs.hold_timeout }}
+    steps:
+      - id: compute
+        env:
+          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
+        run: |
+          set -euo pipefail
+          if [[ "$MANUAL_MINUTES" == "0" ]]; then
+            echo "job_timeout=45" >> "$GITHUB_OUTPUT"
+            echo "hold_timeout=10" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ ! "$MANUAL_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "manual_minutes must be a whole number of minutes, got '$MANUAL_MINUTES'"
+            exit 1
+          fi
+          # 10# keeps a leading zero from being read as octal.
+          MINUTES=$((10#$MANUAL_MINUTES))
+          echo "job_timeout=$((MINUTES + 60))" >> "$GITHUB_OUTPUT"
+          echo "hold_timeout=$((MINUTES + 10))" >> "$GITHUB_OUTPUT"
+
   ios:
     name: ios-simulator
-    runs-on: macos-26
-    timeout-minutes: 45
+    needs: plan
+    # A manual run holds a VNC desktop on the Intel image; normal runs stay on ARM
+    # with the 45-minute cap. GitHub caps hosted jobs at 360 minutes, and the CLI
+    # caps --manual at 300, so 60 + manual_minutes never exceeds that ceiling.
+    runs-on: ${{ inputs.manual_minutes != '0' && 'macos-26-intel' || 'macos-26' }}
+    timeout-minutes: ${{ fromJSON(needs.plan.outputs.job_timeout) }}
     env:
       DEBUG_PUBLIC_LOGS: ${{ inputs.debug_public_logs }}
+      MANUAL_MINUTES: ${{ inputs.manual_minutes }}
     steps:
       - name: Checkout private app
         uses: actions/checkout@v7
@@ -66,6 +107,15 @@ jobs:
           done < <(grep -l -- 'PRIVATE KEY' "$RUNNER_TEMP"/* 2>/dev/null || true)
           echo "removed ${removed} key file(s) from RUNNER_TEMP"
 
+      # Manual runs expose Screen Sharing (VNC) to the tester's private tailnet only.
+      # The action creates an ephemeral node; it leaves the tailnet when the job ends.
+      # VNC is never published to the internet.
+      - name: Connect Tailscale
+        if: inputs.manual_minutes != '0'
+        uses: tailscale/github-action@v4
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
       - name: Select Xcode
         run: |
           sudo xcode-select -s /Applications/Xcode_26.6.app
@@ -80,6 +130,7 @@ jobs:
 
       - name: Install web dependencies
         working-directory: app
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/ci-logs"
@@ -91,6 +142,7 @@ jobs:
 
       - name: Build web assets
         working-directory: app
+        timeout-minutes: 15
         run: |
           set -euo pipefail
           npm run build > "$RUNNER_TEMP/ci-logs/npm-build.log" 2>&1 || {
@@ -101,6 +153,7 @@ jobs:
 
       - name: Sync Capacitor iOS project
         working-directory: app
+        timeout-minutes: 10
         run: |
           set -euo pipefail
           if [[ ! -d ios/App ]]; then npx cap add ios; fi
@@ -112,6 +165,7 @@ jobs:
 
       - name: Build for iOS Simulator
         working-directory: app
+        timeout-minutes: 20
         run: |
           set -euo pipefail
           if [[ -d ios/App/App.xcworkspace ]]; then
@@ -168,11 +222,13 @@ jobs:
           APP_PATH=$(find "$RUNNER_TEMP/DerivedData/Build/Products/Debug-iphonesimulator" \
             -maxdepth 1 -name 'App.app' | head -n1)
           if [[ -z "$APP_PATH" ]]; then echo "built .app not found"; exit 1; fi
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           xcrun simctl install "$UDID" "$APP_PATH"
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
           echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
 
       - name: Install Maestro
+        timeout-minutes: 5
         env:
           MAESTRO_VERSION: 2.12.1
         run: |
@@ -279,6 +335,180 @@ jobs:
           echo "Maestro smoke test did not run"
           exit 1
 
+      # Manual runs: enable the built-in Screen Sharing server, join the tailnet (the
+      # step above), and publish the tailnet address to the private app repo. Runs even
+      # when the build or smoke test failed so the tester can inspect the desktop. The
+      # deploy key is materialized only here, after all app code has run, and removed
+      # before the hold; the final publish step materializes it again.
+      - name: Enable VNC desktop
+        if: always() && inputs.manual_minutes != '0'
+        timeout-minutes: 10
+        env:
+          RUN_ID: ${{ github.run_id }}
+          APP_REPO: ${{ secrets.APP_REPO }}
+          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
+        run: |
+          set -euo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+
+          if (( ${#VNC_PASSWORD} < 8 )); then
+            echo "VNC_PASSWORD must be at least 8 characters (legacy VNC uses the first 8)"
+            exit 1
+          fi
+          if [[ -z "$VNC_USER_PASSWORD" ]]; then
+            echo "VNC_USER_PASSWORD is empty"
+            exit 1
+          fi
+
+          caffeinate -u -t 1 || true
+          RUNNER_USER=$(whoami)
+          sudo dscl . -passwd "/Users/$RUNNER_USER" "$VNC_USER_PASSWORD" \
+            || echo "warning: could not set the runner account password; use the VNC-only password"
+
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          sudo "$KICKSTART" -activate -configure -access -on \
+            -allowAccessFor -allUsers -privs -all \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -restart -agent -console
+          sudo "$KICKSTART" -activate
+
+          # macOS 14+ ignores kickstart's VNC password; write the legacy VNC password
+          # file directly (8 characters, obfuscated with Apple's fixed key).
+          printf '%s' "$VNC_PASSWORD" | perl -we '
+            BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }
+            $_ = <>;
+            chomp;
+            s/^(.{8}).*/$1/;
+            @p = unpack "C*", $_;
+            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }
+            print "\n"' \
+            | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
+          sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
+
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo "$KICKSTART" -restart -agent -console
+
+          for _ in $(seq 1 30); do
+            if sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          if ! sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "Screen Sharing is not listening on 5900"
+            sudo lsof -iTCP -sTCP:LISTEN | head -20 || true
+            exit 1
+          fi
+
+          # The Intel image is a VMware VM; make the desktop usable if the tool exists.
+          if [[ -x "/Library/Application Support/VMware Tools/vmware-resolutionSet" ]]; then
+            sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
+          fi
+
+          # The Tailscale MagicDNS name is the private address the tester connects to.
+          # `|| true` so a failing probe lands in the diagnostic below instead of
+          # aborting under `set -e`; `head -1` can also SIGPIPE the producer.
+          TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+          VNC_ADDRESS="${TS_DNS:-$TS_IP}:5900"
+          if [[ "$VNC_ADDRESS" == ":5900" ]]; then
+            echo "could not determine the Tailscale address"
+            tailscale status || true
+            exit 1
+          fi
+
+          {
+            echo "run_id: ${RUN_ID}"
+            echo "vnc_address: ${VNC_ADDRESS}"
+            echo "vnc_user: ${RUNNER_USER}"
+            echo "session_minutes: ${MANUAL_MINUTES}"
+            echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > "$LOGS/manual-ready.txt"
+
+          # Publish the address through the private app repo; the deploy key exists
+          # only for this push and is removed before the manual hold.
+          KEY="$RUNNER_TEMP/manual_key"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/manual_known_hosts"
+          TMP="$RUNNER_TEMP/manual-publish"
+          rm -rf "$TMP"
+          mkdir -p "$TMP/ci-logs"
+          cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
+          git -C "$TMP" init -q
+          git -C "$TMP" config user.name ios-ci
+          git -C "$TMP" config user.email ios-ci@users.noreply.github.com
+          git -C "$TMP" add ci-logs/manual-ready.txt
+          git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
+          git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs
+          echo "VNC_READY=1" >> "$GITHUB_ENV"
+          echo "VNC_ADDRESS=${VNC_ADDRESS}" >> "$GITHUB_ENV"
+          echo "remote desktop ready; address published to the private ci-logs branch"
+
+      - name: Manual test session
+        if: always() && inputs.manual_minutes != '0'
+        timeout-minutes: ${{ fromJSON(needs.plan.outputs.hold_timeout) }}
+        env:
+          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
+        run: |
+          set -euo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+          if [[ "${VNC_READY:-0}" != "1" ]]; then
+            echo "remote desktop was not enabled; skipping the manual hold"
+            exit 0
+          fi
+          caffeinate -u -t 1 || true
+          if [[ -n "${APP_PATH:-}" && -n "${UDID:-}" && -n "${BUNDLE_ID:-}" ]]; then
+            xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
+            xcrun simctl uninstall "$UDID" "$BUNDLE_ID" 2>/dev/null || true
+            xcrun simctl install "$UDID" "$APP_PATH" \
+              || echo "warning: reinstall failed; using the installed build"
+            xcrun simctl launch "$UDID" "$BUNDLE_ID" || true
+            xcrun simctl io "$UDID" screenshot "$LOGS/manual-start.png" >/dev/null 2>&1 || true
+            {
+              echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+              echo "simulator: ${SIMULATOR:-unknown}"
+              echo "bundle_id: ${BUNDLE_ID}"
+              echo "duration: ${MANUAL_MINUTES} minutes"
+            } > "$LOGS/manual-session.txt"
+          else
+            echo "no installed app; holding the desktop for inspection"
+            {
+              echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+              echo "duration: ${MANUAL_MINUTES} minutes"
+            } > "$LOGS/manual-session.txt"
+          fi
+          if [[ -n "${UDID:-}" ]]; then
+            open -a Simulator --args -CurrentDeviceUDID "$UDID" 2>/dev/null \
+              || echo "warning: open Simulator from the VNC desktop"
+          else
+            open -a Simulator 2>/dev/null || echo "warning: open Simulator from the VNC desktop"
+          fi
+          if [[ -d app/ios/App/App.xcworkspace ]]; then
+            open app/ios/App/App.xcworkspace 2>/dev/null || true
+          elif [[ -d app/ios/App/App.xcodeproj ]]; then
+            open app/ios/App/App.xcodeproj 2>/dev/null || true
+          fi
+          echo "Manual session open for ${MANUAL_MINUTES} minutes; connect over VNC."
+          sleep $(( 10#${MANUAL_MINUTES} * 60 ))
+          if [[ -n "${UDID:-}" ]]; then
+            xcrun simctl io "$UDID" screenshot "$LOGS/manual-end.png" >/dev/null 2>&1 || true
+          fi
+          echo "ended: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$LOGS/manual-session.txt"
+
+      - name: Clean up manual session
+        if: always() && inputs.manual_minutes != '0'
+        run: |
+          set +e
+          if [[ -n "${UDID:-}" ]]; then xcrun simctl shutdown "$UDID" 2>/dev/null; fi
+          killall Simulator 2>/dev/null
+          killall Xcode 2>/dev/null
+          true
+
       - name: Publish logs to private repo
         if: always()
         env:
@@ -313,6 +543,7 @@ jobs:
             echo "xcode: $(xcodebuild -version | tr '\n' ' ')"
             echo "simulator: ${SIMULATOR:-unknown}"
             echo "bundle_id: ${BUNDLE_ID:-unknown}"
+            echo "manual_minutes: ${MANUAL_MINUTES:-0}"
             echo "maestro_attempts: $(ls "$LOGS"/maestro-*.log 2>/dev/null | wc -l | tr -d ' ')"
           } > "$LOGS/summary.txt" 2>/dev/null || true
 
@@ -352,7 +583,22 @@ jobs:
             echo "correlation \`${CORRELATION}\`, app \`${APP_SHA}\` (${APP_REF}), ${SIMULATOR:-unknown simulator}."
             echo
             shown=0
-            for img in $(find ci-logs -type f \( -name '*.png' -o -name '*.jpg' \) 2>/dev/null | sort | head -n 6); do
+            if [[ "${MANUAL_MINUTES:-0}" != "0" ]]; then
+              echo "Manual session: ${MANUAL_MINUTES} minutes on a hosted VNC desktop."
+              if [[ -f ci-logs/manual-ready.txt ]]; then
+                echo
+                echo "VNC address: \`$(sed -n 's/^vnc_address: //p' ci-logs/manual-ready.txt | head -1)\` (VNC password from the \`VNC_PASSWORD\` secret)."
+              fi
+              echo
+            fi
+            for img in ci-logs/manual-start.png ci-logs/manual-end.png; do
+              [[ -f "$img" ]] || continue
+              shown=$((shown + 1))
+              echo "![manual session ${shown}](${img})"
+              echo
+            done
+            for img in $(find ci-logs -type f \( -name '*.png' -o -name '*.jpg' \) \
+              ! -name 'manual-*.png' 2>/dev/null | sort | head -n 6); do
               shown=$((shown + 1))
               echo "![screenshot ${shown}](${img})"
               echo

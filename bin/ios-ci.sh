@@ -17,6 +17,7 @@ set -euo pipefail
 RUNNER_REPO="${IOS_CI_RUNNER:-eshahrabani/ios-ci}"
 WORKFLOW="ios-ci.yml"
 TIMEOUT_MIN=60
+TIMEOUT_SET=false
 OUT_DIR=""
 SMOKE_TEXT=""
 REF=""
@@ -24,6 +25,7 @@ APP_DIR=""
 DEBUG_LOGS=false
 DRY_RUN=false
 DEPLOY_KEY=""
+MANUAL_MINUTES=0
 
 usage() {
   cat <<'USAGE'
@@ -44,12 +46,21 @@ options:
                       generated and installed as a write deploy key when missing)
   --runner OWNER/NAME runner repo (default: eshahrabani/ios-ci or $IOS_CI_RUNNER)
   --timeout MIN       minutes to wait for the run (default: 60)
+  --manual MINUTES    hold a hosted VNC desktop for manual testing (1-300)
   --dry-run           print the commands instead of executing them
   -h, --help          this text
+
+manual sessions:
+  the tester's machine must be on the same Tailscale tailnet; set repo secrets
+  TAILSCALE_AUTH_KEY, VNC_PASSWORD (8 characters) and VNC_USER_PASSWORD.
+  The CLI prints the VNC address when the desktop is ready; connect with any VNC
+  client using VNC_PASSWORD. --manual accepts 1-300 minutes; the hosted job cap is
+  360.
 
 examples:
   ios-ci.sh prepare && ios-ci.sh run
   ios-ci.sh configure ~/git/my-app && ios-ci.sh run ~/git/my-app --smoke-text "Welcome"
+  ios-ci.sh run ~/git/my-app --manual 30 --smoke-text "Welcome"
 USAGE
 }
 
@@ -206,6 +217,15 @@ cmd_configure() {
 cmd_run() {
   resolve_app_dir "$1"
   preflight
+  if [[ "$MANUAL_MINUTES" != "0" ]]; then
+    [[ "$MANUAL_MINUTES" =~ ^[0-9]+$ ]] || die "--manual needs a whole number of minutes"
+    # 10# avoids bash reading a leading zero as octal (`--manual 08`).
+    MANUAL_MINUTES=$((10#$MANUAL_MINUTES))
+    (( MANUAL_MINUTES >= 1 && MANUAL_MINUTES <= 300 )) \
+      || die "--manual must be 1-300 minutes"
+    # The job cap is 60 + manual_minutes, so the wait must outlast that.
+    if [[ "$TIMEOUT_SET" != true ]]; then TIMEOUT_MIN=$((75 + MANUAL_MINUTES)); fi
+  fi
   local app sha export_ref text
   app=$(app_repo_of) || exit 2
   [[ -n "$app" ]] || die "could not derive OWNER/NAME from $APP_DIR's origin remote"
@@ -235,20 +255,37 @@ cmd_run() {
     note "[dry-run] gh workflow run $WORKFLOW --repo $RUNNER_REPO --ref main \\"
     note "            -f sha=$sha -f ref=$export_ref \\"
     note "            -f correlation_id=$correlation -f smoke_text='$SMOKE_TEXT' \\"
-    note "            -f debug_public_logs=$DEBUG_LOGS"
+    note "            -f debug_public_logs=$DEBUG_LOGS \\"
+    note "            -f manual_minutes=$MANUAL_MINUTES"
+    note "timeout : ${TIMEOUT_MIN} min"
+    if [[ "$MANUAL_MINUTES" != "0" ]]; then
+      note "manual : a hosted VNC desktop for ${MANUAL_MINUTES} min; the address is published to the private ci-logs branch"
+    fi
     return 0
   fi
 
   need_tools
+  if [[ "$MANUAL_MINUTES" != "0" ]]; then
+    local secret_names
+    if secret_names=$(gh secret list --repo "$RUNNER_REPO" --json name --jq '.[].name' 2>/dev/null); then
+      for s in TAILSCALE_AUTH_KEY VNC_PASSWORD VNC_USER_PASSWORD; do
+        grep -qx "$s" <<<"$secret_names" || die "missing secret $s on $RUNNER_REPO.
+     set it with: gh secret set $s --repo $RUNNER_REPO"
+      done
+    else
+      warn "could not list secrets on $RUNNER_REPO; ensure TAILSCALE_AUTH_KEY, VNC_PASSWORD and VNC_USER_PASSWORD are set"
+    fi
+  fi
   gh workflow run "$WORKFLOW" --repo "$RUNNER_REPO" --ref main \
     -f "sha=$sha" -f "ref=$export_ref" \
     -f "correlation_id=$correlation" -f "smoke_text=$SMOKE_TEXT" \
-    -f "debug_public_logs=$DEBUG_LOGS" >/dev/null \
+    -f "debug_public_logs=$DEBUG_LOGS" \
+    -f "manual_minutes=$MANUAL_MINUTES" >/dev/null \
     || die "dispatch failed (does the runner accept workflow_dispatch on main?)"
 
   # Exact title match: correlations are unique per dispatch, but a substring match
   # would also hit a longer id that happens to start with this one.
-  local title run_id="" waited=0
+  local title run_id="" waited=0 manual_ready=false
   title="ios-ci $correlation"
   while [[ "$waited" -lt 300 ]]; do
     run_id=$(gh run list --repo "$RUNNER_REPO" --workflow "$WORKFLOW" --limit 100 \
@@ -262,6 +299,21 @@ cmd_run() {
 
   local status conclusion elapsed=0
   while [[ "$elapsed" -lt $((TIMEOUT_MIN * 60)) ]]; do
+    if [[ "$MANUAL_MINUTES" != "0" && "$manual_ready" != true ]]; then
+      local manual_file vnc_address vnc_user
+      manual_file=$(gh api "repos/$app/contents/ci-logs/manual-ready.txt?ref=ci-logs" \
+        -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
+      if [[ -n "$manual_file" ]]; then
+        vnc_address=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_address: //p' | head -1)
+        vnc_user=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_user: //p' | head -1)
+        if [[ -n "$vnc_address" ]]; then
+          manual_ready=true
+          note "manual : VNC desktop ready at $vnc_address"
+          note "         VNC password: the 8-character VNC_PASSWORD secret"
+          note "         Apple Screen Sharing / RealVNC: user ${vnc_user:-runner}, password VNC_USER_PASSWORD"
+        fi
+      fi
+    fi
     status=$(gh api "repos/$RUNNER_REPO/actions/runs/$run_id" --jq '.status')
     [[ "$status" == "completed" ]] && break
     sleep 20; elapsed=$((elapsed + 20))
@@ -311,8 +363,9 @@ fetch_artifacts() {
 report() {
   local run_id="$1" app="$2" out="$3"
   local summary="$out/ci-logs/summary.txt"
-  local reported_repo=""
+  local reported_repo="" manual=""
   [[ -f "$summary" ]] && reported_repo=$(sed -n 's/^app_repo: //p' "$summary" | head -1)
+  [[ -f "$summary" ]] && manual=$(sed -n 's/^manual_minutes: //p' "$summary" | head -1)
 
   note ""
   note "run $run_id → $out"
@@ -324,9 +377,13 @@ report() {
     note "  attempts : $(sed -n 's/^maestro_attempts: //p' "$summary" | head -1)"
     note "  simulator: $(sed -n 's/^simulator: //p' "$summary" | head -1)"
     note "  xcode    : $(sed -n 's/^xcode: //p' "$summary" | head -1 | sed 's/ *$//')"
+    if [[ -n "$manual" && "$manual" != "0" ]]; then note "  duration : ${manual} min"; fi
   fi
   if [[ -f "$out/ci-logs/maestro.log" ]]; then
     note "  flow     : $(grep -E 'Flow (Passed|Failed)|flow passed|flow failed' "$out/ci-logs/maestro.log" | tail -1 || echo 'see maestro.log')"
+  fi
+  if [[ -f "$out/ci-logs/manual-ready.txt" ]]; then
+    note "  manual   : $(sed -n 's/^vnc_address: //p' "$out/ci-logs/manual-ready.txt" | head -1)"
   fi
   local media
   media=$(find "$out" -type f \( -name '*.png' -o -name '*.mp4' -o -name '*.mov' \) 2>/dev/null | sort)
@@ -359,7 +416,8 @@ while [[ $# -gt 0 ]]; do
     --out) OUT_DIR="${2:?--out needs a value}"; shift 2 ;;
     --deploy-key) DEPLOY_KEY="${2:?--deploy-key needs a path}"; shift 2 ;;
     --runner) RUNNER_REPO="${2:?--runner needs OWNER/NAME}"; shift 2 ;;
-    --timeout) TIMEOUT_MIN="${2:?--timeout needs minutes}"; shift 2 ;;
+    --timeout) TIMEOUT_MIN="${2:?--timeout needs minutes}"; TIMEOUT_SET=true; shift 2 ;;
+    --manual) MANUAL_MINUTES="${2:?--manual needs minutes}"; shift 2 ;;
     --debug-logs) DEBUG_LOGS=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     -h|--help) usage; exit 0 ;;

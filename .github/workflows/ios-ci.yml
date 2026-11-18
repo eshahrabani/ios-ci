@@ -431,11 +431,29 @@ jobs:
           TCCDB="/Library/Application Support/com.apple.TCC/TCC.db"
           for client in \
             "/System/Library/CoreServices/RemoteManagement/screensharingd" \
-            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent"; do
-            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceScreenCapture','$client',1,2,0,1,0)" 2>&1 | head -2 || true
+            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent" \
+            "com.apple.RemoteDesktop.agent" \
+            "com.apple.ScreenSharing" \
+            "com.apple.screensharingd"; do
+            ctype=1
+            [[ "$client" == com.apple.* ]] && ctype=0
+            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceScreenCapture','$client',$ctype,2,0,1,0)" 2>&1 | head -2 || true
+          done
+          # Control needs Accessibility too, for the agent and for the tooling below.
+          for client in "/bin/bash" "/usr/bin/osascript" "com.apple.RemoteDesktop.agent"; do
+            ctype=1
+            [[ "$client" == com.apple.* ]] && ctype=0
+            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceAccessibility','$client',$ctype,2,0,1,0)" 2>&1 | head -2 || true
           done
           sudo killall tccd 2>/dev/null || true
           sleep 1
+          # Restart the agent and the daemon in that order: the daemon caches the
+          # agent's XPC port and reports "invalid agent port" if it starts first.
+          sudo launchctl kickstart -k "gui/$CONSOLE_UID/com.apple.RemoteDesktop.agent" 2>&1 || true
+          sudo killall ARDAgent 2>/dev/null || true
+          sleep 2
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 || true
+          sleep 2
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
           sudo "$KICKSTART" -restart -agent -console </dev/null || true

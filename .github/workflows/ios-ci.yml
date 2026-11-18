@@ -237,6 +237,7 @@ jobs:
             }
 
       - name: Boot simulator and install app
+        id: boot
         working-directory: app
         timeout-minutes: 10
         run: |
@@ -277,6 +278,121 @@ jobs:
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
           echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
 
+      # Manual runs: enable the built-in Screen Sharing server, join the tailnet (the
+      # step above), and publish the tailnet address to the private app repo. Runs even
+      # when the build or smoke test failed so the tester can inspect the desktop. The
+      # deploy key is materialized only here, after all app code has run, and removed
+      # before the hold; the final publish step materializes it again.
+      #
+      # The server accepts only Apple authentication (RFB 30/33/35/36), so the tester
+      # signs in as the `tester` account created here; clients must support Apple
+      # Screen Sharing auth (macOS Screen Sharing, RealVNC, Jump). Remmina, TigerVNC
+      # and other plain-VNC clients cannot authenticate to macOS 26.
+      - name: Enable VNC desktop
+        if: always() && inputs.manual_minutes != '0'
+        timeout-minutes: 10
+        env:
+          RUN_ID: ${{ github.run_id }}
+          APP_REPO: ${{ secrets.APP_REPO }}
+          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
+        run: |
+          set -euo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+
+          if [[ -z "$VNC_USER_PASSWORD" ]]; then
+            echo "VNC_USER_PASSWORD is empty"
+            exit 1
+          fi
+
+          caffeinate -u -t 1 || true
+
+          # macOS 26 Screen Sharing advertises legacy VNC auth (RFB type 2) but drops
+          # the connection when a client selects it (measured at 003.008 and 003.889,
+          # with every password store), and the runner account carries a Secure Token
+          # so its password cannot be set. The credential that works is an account
+          # password via Apple auth (type 30), so create a dedicated admin account and
+          # prove it accepts the secret before publishing an address.
+          VNC_USER=tester
+          if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
+            sudo sysadminctl -addUser "$VNC_USER" -fullName "iOS CI tester" \
+              -password "$VNC_USER_PASSWORD" -admin
+          fi
+          if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" 2>/dev/null; then
+            echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
+            exit 1
+          fi
+
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          # Grant the account explicitly: with "all users" macOS still refuses some
+          # accounts at the ARD authorization step even though the password is right.
+          sudo "$KICKSTART" -activate -configure -access -on \
+            -users "$VNC_USER" -privs -all \
+            -restart -agent -console
+          sudo launchctl enable system/com.apple.screensharing
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          sudo launchctl kickstart -k system/com.apple.screensharing
+          sudo "$KICKSTART" -restart -agent -console
+
+          for _ in $(seq 1 30); do
+            if sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          if ! sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "Screen Sharing is not listening on 5900"
+            sudo lsof -iTCP -sTCP:LISTEN | head -20 || true
+            exit 1
+          fi
+
+          # The Intel image is a VMware VM; make the desktop usable if the tool exists.
+          if [[ -x "/Library/Application Support/VMware Tools/vmware-resolutionSet" ]]; then
+            sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
+          fi
+
+          # The Tailscale MagicDNS name is the private address the tester connects to.
+          # `|| true` so a failing probe lands in the diagnostic below instead of
+          # aborting under `set -e`; `head -1` can also SIGPIPE the producer.
+          TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
+          VNC_ADDRESS="${TS_DNS:-$TS_IP}:5900"
+          if [[ "$VNC_ADDRESS" == ":5900" ]]; then
+            echo "could not determine the Tailscale address"
+            tailscale status || true
+            exit 1
+          fi
+
+          {
+            echo "run_id: ${RUN_ID}"
+            echo "vnc_address: ${VNC_ADDRESS}"
+            echo "vnc_user: ${RUNNER_USER}"
+            echo "session_minutes: ${MANUAL_MINUTES}"
+            echo "vnc_auth: apple"
+            echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          } > "$LOGS/manual-ready.txt"
+
+          # Publish the address through the private app repo; the deploy key exists
+          # only for this push and is removed before the manual hold.
+          KEY="$RUNNER_TEMP/manual_key"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
+          chmod 600 "$KEY"
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/manual_known_hosts"
+          TMP="$RUNNER_TEMP/manual-publish"
+          rm -rf "$TMP"
+          mkdir -p "$TMP/ci-logs"
+          cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
+          git -C "$TMP" init -q
+          git -C "$TMP" config user.name ios-ci
+          git -C "$TMP" config user.email ios-ci@users.noreply.github.com
+          git -C "$TMP" add ci-logs/manual-ready.txt
+          git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
+          git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs
+          echo "VNC_READY=1" >> "$GITHUB_ENV"
+          echo "VNC_ADDRESS=${VNC_ADDRESS}" >> "$GITHUB_ENV"
+          echo "remote desktop ready; address published to the private ci-logs branch"
+
       - name: Install Maestro
         timeout-minutes: 5
         env:
@@ -299,6 +415,10 @@ jobs:
       # one simulator kill each other, so reap them between attempts. Worst case is
       # 600 + 300 s, and the 20-minute step cap still holds.
       - name: Run Maestro smoke test
+        # The desktop is enabled before this step, so the tester can watch the flow and
+        # the smoke result must survive a desktop failure; it is still skipped when the
+        # simulator never booted.
+        if: always() && steps.boot.outcome == 'success'
         working-directory: app
         timeout-minutes: 20
         env:
@@ -384,121 +504,6 @@ jobs:
           done
           echo "Maestro smoke test did not run"
           exit 1
-
-      # Manual runs: enable the built-in Screen Sharing server, join the tailnet (the
-      # step above), and publish the tailnet address to the private app repo. Runs even
-      # when the build or smoke test failed so the tester can inspect the desktop. The
-      # deploy key is materialized only here, after all app code has run, and removed
-      # before the hold; the final publish step materializes it again.
-      #
-      # The server accepts only Apple authentication (RFB 30/33/35/36), so the tester
-      # signs in as the `tester` account created here; clients must support Apple
-      # Screen Sharing auth (macOS Screen Sharing, RealVNC, Jump). Remmina, TigerVNC
-      # and other plain-VNC clients cannot authenticate to macOS 26.
-      - name: Enable VNC desktop
-        if: always() && inputs.manual_minutes != '0'
-        timeout-minutes: 10
-        env:
-          RUN_ID: ${{ github.run_id }}
-          APP_REPO: ${{ secrets.APP_REPO }}
-          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
-          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
-          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
-        run: |
-          set -euo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
-          mkdir -p "$LOGS"
-
-          if [[ -z "$VNC_USER_PASSWORD" ]]; then
-            echo "VNC_USER_PASSWORD is empty"
-            exit 1
-          fi
-
-          caffeinate -u -t 1 || true
-
-          # macOS 26 Screen Sharing advertises legacy VNC auth (RFB type 2) but drops
-          # the connection when a client selects it (measured at 003.008 and 003.889,
-          # with every password store), and the runner account carries a Secure Token
-          # so its password cannot be set. The credential that works is an account
-          # password via Apple auth (type 30), so create a dedicated admin account and
-          # prove it accepts the secret before publishing an address.
-          VNC_USER=tester
-          if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
-            sudo sysadminctl -addUser "$VNC_USER" -fullName "iOS CI tester" \
-              -password "$VNC_USER_PASSWORD" -admin
-          fi
-          if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" 2>/dev/null; then
-            echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
-            exit 1
-          fi
-
-          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          # Grant the account explicitly: with "all users" macOS still refuses some
-          # accounts at the ARD authorization step even though the password is right.
-          sudo "$KICKSTART" -activate -configure -access -on \
-            -users "$VNC_USER" -privs -all \
-            -restart -agent -console
-          sudo launchctl enable system/com.apple.screensharing
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-          sudo launchctl kickstart -k system/com.apple.screensharing
-          sudo "$KICKSTART" -restart -agent -console
-
-          for i in $(seq 1 30); do
-            if sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then break; fi
-            sleep 1
-          done
-          if ! sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
-            echo "Screen Sharing is not listening on 5900"
-            sudo lsof -iTCP -sTCP:LISTEN | head -20 || true
-            exit 1
-          fi
-
-          # The Intel image is a VMware VM; make the desktop usable if the tool exists.
-          if [[ -x "/Library/Application Support/VMware Tools/vmware-resolutionSet" ]]; then
-            sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
-          fi
-
-          # The Tailscale MagicDNS name is the private address the tester connects to.
-          # `|| true` so a failing probe lands in the diagnostic below instead of
-          # aborting under `set -e`; `head -1` can also SIGPIPE the producer.
-          TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
-          TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
-          VNC_ADDRESS="${TS_DNS:-$TS_IP}:5900"
-          if [[ "$VNC_ADDRESS" == ":5900" ]]; then
-            echo "could not determine the Tailscale address"
-            tailscale status || true
-            exit 1
-          fi
-
-          {
-            echo "run_id: ${RUN_ID}"
-            echo "vnc_address: ${VNC_ADDRESS}"
-            echo "vnc_user: ${RUNNER_USER}"
-            echo "session_minutes: ${MANUAL_MINUTES}"
-            echo "vnc_auth: apple"
-            echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-          } > "$LOGS/manual-ready.txt"
-
-          # Publish the address through the private app repo; the deploy key exists
-          # only for this push and is removed before the manual hold.
-          KEY="$RUNNER_TEMP/manual_key"
-          trap 'rm -f "$KEY"' EXIT
-          printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
-          chmod 600 "$KEY"
-          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/manual_known_hosts"
-          TMP="$RUNNER_TEMP/manual-publish"
-          rm -rf "$TMP"
-          mkdir -p "$TMP/ci-logs"
-          cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
-          git -C "$TMP" init -q
-          git -C "$TMP" config user.name ios-ci
-          git -C "$TMP" config user.email ios-ci@users.noreply.github.com
-          git -C "$TMP" add ci-logs/manual-ready.txt
-          git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
-          git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs
-          echo "VNC_READY=1" >> "$GITHUB_ENV"
-          echo "VNC_ADDRESS=${VNC_ADDRESS}" >> "$GITHUB_ENV"
-          echo "remote desktop ready; address published to the private ci-logs branch"
 
       - name: Manual test session
         if: always() && inputs.manual_minutes != '0'

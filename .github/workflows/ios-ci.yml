@@ -652,6 +652,9 @@ jobs:
         timeout-minutes: ${{ fromJSON(needs.plan.outputs.hold_timeout) }}
         env:
           MANUAL_MINUTES: ${{ inputs.manual_minutes }}
+          RUN_ID: ${{ github.run_id }}
+          APP_REPO: ${{ secrets.APP_REPO }}
+          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
         run: |
           set -euo pipefail
           LOGS="$RUNNER_TEMP/ci-logs"
@@ -661,6 +664,30 @@ jobs:
             exit 0
           fi
           caffeinate -u -t 1 || true
+          # What the daemon says while a client connects is the only way to name the
+          # reason it refuses to stream; publish it here, not at job end.
+          (
+            sleep 75
+            {
+              echo "== connect-time log"
+              sudo log show --predicate 'process == "screensharingd"' --last 3m 2>/dev/null \
+                | grep -Ei 'capture|viewer|client|error|denied|stream|display' | tail -30
+            } > "$LOGS/screensharingd-after.log" 2>&1
+            KEY="$RUNNER_TEMP/diag_key"
+            printf '%s\n' "${APP_DEPLOY_KEY:-}" > "$KEY"
+            chmod 600 "$KEY"
+            TMP="$RUNNER_TEMP/diag-publish"
+            rm -rf "$TMP"; mkdir -p "$TMP/ci-logs"
+            cp "$LOGS/screensharingd-after.log" "$TMP/ci-logs/"
+            git -C "$TMP" init -q
+            git -C "$TMP" config user.name ios-ci
+            git -C "$TMP" config user.email ios-ci@users.noreply.github.com
+            git -C "$TMP" add ci-logs/screensharingd-after.log
+            git -C "$TMP" commit -q -m "daemon log ${RUN_ID}"
+            GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/diag_known_hosts" \
+              git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs 2>&1 | tail -2 || true
+            rm -f "$KEY"
+          ) &
           # The desktop is the deliverable: open the tools the tester needs and give the
           # session a moment to come up before the first connection lands.
           open -a Simulator 2>/dev/null || true

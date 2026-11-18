@@ -409,30 +409,33 @@ jobs:
             exit 1
           fi
 
-          # A client that authenticates as an account not owning the console gets its
-          # own session, and on this VM that session renders black. Prefer the console
-          # account whenever the image's own password still works.
+          # The console desktop is the one the screenshots show; a client that
+          # authenticates as another account gets a second session that renders black
+          # on this VM. So give the console account this known password, using the
+          # token-holding admin account created above (sysadminctl refuses otherwise:
+          # "Operation is not permitted without secure token unlock").
           CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
-          PASSWORD_HINT=""
           if [[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]]; then
-            for cand in runner password admin changeme; do
-              if dscl . -authonly "$CONSOLE_USER" "$cand" </dev/null 2>/dev/null; then
-                VNC_USER="$CONSOLE_USER"
-                PASSWORD_HINT="image default ($cand)"
-                echo "console account ${VNC_USER} accepts the image default password"
-                sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null || true
-                sudo "$KICKSTART" -activate -configure -access -on \
-                  -users "$VNC_USER" -privs -all -restart -agent -console </dev/null || true
-                break
-              fi
-            done
+            sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" \
+              -newPassword "$VNC_USER_PASSWORD" \
+              -adminUser "$VNC_USER" -adminPassword "$VNC_USER_PASSWORD" </dev/null 2>&1 || true
+            if ! dscl . -authonly "$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
+              sudo dscl . -passwd "/Users/$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>&1 || true
+            fi
+            if dscl . -authonly "$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
+              VNC_USER="$CONSOLE_USER"
+              echo "console account now accepts VNC_USER_PASSWORD; clients attach to its desktop"
+              sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null || true
+              sudo "$KICKSTART" -activate -configure -access -on \
+                -users "$VNC_USER" -privs -all -restart -agent -console </dev/null || true
+            else
+              echo "warning: the console account still rejects VNC_USER_PASSWORD"
+            fi
           fi
           # Prove what the desk actually shows: the console framebuffer, captured as the
           # logged-in user, is published with the address so a black client is not the
           # only evidence available.
           sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop-console.png" 2>&1 || true
-          sudo screencapture -x "$LOGS/desktop-root.png" 2>&1 || true
-          ls -l "$LOGS"/desktop-*.png 2>&1 || true
           echo "note: if the first connection drops, reconnect - macOS switched the console to ${VNC_USER}"
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart

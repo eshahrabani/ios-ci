@@ -380,7 +380,7 @@ jobs:
             echo "run_id: ${RUN_ID}"
             echo "vnc_address: ${VNC_ADDRESS}"
             echo "vnc_dns: ${TS_DNS}:5900"
-            echo "vnc_user: ${RUNNER_USER}"
+            echo "vnc_user: ${VNC_USER}"
             echo "session_minutes: ${MANUAL_MINUTES}"
             echo "vnc_auth: apple"
             echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"

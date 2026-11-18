@@ -442,6 +442,20 @@ jobs:
           echo "console user: ${CONSOLE_USER}"
           sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop.png" 2>&1 || true
 
+          # Why can the daemon not stream? Its own log says so.
+          {
+            echo "== kickstart options"
+            sudo "$KICKSTART" -h 2>&1 | grep -Ei 'screen|control|curtain|capture' | head -20
+            echo "== runner auth authority"
+            dscl . -read /Users/runner AuthenticationAuthority 2>&1 | head -4
+            echo "== empty password probe"
+            dscl . -authonly runner "" </dev/null 2>&1 || echo "empty rejected"
+            echo "== screensharingd log"
+            sudo log show --predicate 'process == "screensharingd"' --last 5m 2>/dev/null | tail -40
+            echo "== windowserver display"
+            sudo log show --predicate 'process == "WindowServer"' --last 2m 2>/dev/null | grep -Ei 'display|capture|stream' | tail -10
+          } 2>&1 || true
+
           # The tailnet IP resolves everywhere; MagicDNS only for clients whose resolver
           # uses Tailscale's, which a tester's Linux box often does not.
           TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)

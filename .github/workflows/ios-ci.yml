@@ -36,7 +36,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ios-ci
+  # Normal runs keep cancelling each other, but a manual session must survive an
+  # unrelated dispatch: it gets its own group, so nothing cancels the desktop or
+  # the node someone is connected to.
+  group: ios-ci-${{ inputs.manual_minutes != '0' && github.run_id || 'main' }}
   cancel-in-progress: true
 
 jobs:

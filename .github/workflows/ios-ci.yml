@@ -409,29 +409,31 @@ jobs:
             exit 1
           fi
 
-          # The console desktop is the one the screenshots show; a client that
-          # authenticates as another account gets a second session that renders black
-          # on this VM. So give the console account this known password, using the
-          # token-holding admin account created above (sysadminctl refuses otherwise:
-          # "Operation is not permitted without secure token unlock").
+          # Legacy VNC auth (RFB type 2) needs no account: the server checks an
+          # 8-character password from /Library/Preferences/com.apple.VNCSettings.txt
+          # and attaches the client to the console session, which is the desktop the
+          # screenshots show. Apple auth instead creates a session per user, and a new
+          # session renders black on this VM.
           CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
-          if [[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]]; then
-            sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" \
-              -newPassword "$VNC_USER_PASSWORD" \
-              -adminUser "$VNC_USER" -adminPassword "$VNC_USER_PASSWORD" </dev/null 2>&1 || true
-            if ! dscl . -authonly "$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
-              sudo dscl . -passwd "/Users/$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>&1 || true
-            fi
-            if dscl . -authonly "$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
-              VNC_USER="$CONSOLE_USER"
-              echo "console account now accepts VNC_USER_PASSWORD; clients attach to its desktop"
-              sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null || true
-              sudo "$KICKSTART" -activate -configure -access -on \
-                -users "$VNC_USER" -privs -all -restart -agent -console </dev/null || true
-            else
-              echo "warning: the console account still rejects VNC_USER_PASSWORD"
-            fi
-          fi
+          sudo "$KICKSTART" -activate -configure -access -on \
+            -allowAccessFor -allUsers -privs -all \
+            -clientopts -setvnclegacy -vnclegacy yes \
+            -restart -agent -console </dev/null
+          sudo "$KICKSTART" -activate </dev/null
+          printf '%s' "$VNC_PASSWORD" | perl -we '
+            BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }
+            $_ = <STDIN>;
+            chomp;
+            s/^(.{8}).*/$1/;
+            @p = unpack "C*", $_;
+            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }
+            print "\n"' \
+            | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
+          sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 || true
+          sudo "$KICKSTART" -restart -agent -console </dev/null || true
+          sleep 3
+          echo "advertised security types are logged by the probe below"
           # Prove what the desk actually shows: the console framebuffer, captured as the
           # logged-in user, is published with the address so a black client is not the
           # only evidence available.
@@ -494,10 +496,8 @@ jobs:
             echo "repo: ${APP_DIR:-}"
             echo "vnc_address: ${VNC_ADDRESS}"
             echo "vnc_dns: ${TS_DNS}:5900"
-            echo "vnc_user: ${VNC_USER}"
-            echo "vnc_password_hint: ${PASSWORD_HINT:-VNC_USER_PASSWORD}"
             echo "session_minutes: ${MANUAL_MINUTES}"
-            echo "vnc_auth: apple"
+            echo "vnc_auth: vnc"
             echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           } > "$LOGS/manual-ready.txt"
 

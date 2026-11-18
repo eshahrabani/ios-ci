@@ -433,8 +433,10 @@ jobs:
           fi
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          # Grant the account explicitly: with "all users" macOS still refuses some
+          # accounts at the ARD authorization step even though the password is right.
           sudo "$KICKSTART" -activate -configure -access -on \
-            -allowAccessFor -allUsers -privs -all \
+            -users "$VNC_USER" -privs -all \
             -restart -agent -console
           sudo launchctl enable system/com.apple.screensharing
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true

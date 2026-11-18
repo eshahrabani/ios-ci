@@ -54,8 +54,9 @@ manual sessions:
   the tester's machine must be on the same Tailscale tailnet. Repo secrets:
   TAILSCALE_AUTH_KEY (a reusable auth key: tskey-auth-…) and VNC_USER_PASSWORD.
   The desktop is reached as the `tester` account with VNC_USER_PASSWORD, using Apple
-  Screen Sharing authentication (macOS Screen Sharing, RealVNC, Jump). Remmina,
-  TigerVNC and other plain-VNC clients cannot authenticate to macOS 26.
+  ARD authentication (RFB type 30): iVNC on Linux/Windows/macOS, or macOS Screen
+  Sharing. Remmina, TigerVNC and other plain-VNC clients cannot authenticate to
+  macOS 26, whose server advertises legacy VNC auth but drops it.
   The CLI prints the VNC address when the desktop is ready. --manual accepts 1-300
   minutes; the hosted job cap is 360.
 
@@ -332,7 +333,7 @@ cmd_run() {
           manual_ready=true
           note "manual : VNC desktop ready at $vnc_address"
           note "         sign in as ${ready_user:-tester} with the VNC_USER_PASSWORD secret"
-          note "         client must do Apple Screen Sharing auth: macOS Screen Sharing, RealVNC, Jump"
+          note "         use an Apple-ARD client: iVNC (Linux/Windows/macOS) or macOS Screen Sharing"
           note "         Remmina/TigerVNC cannot authenticate: macOS 26 offers Apple auth only"
         fi
       fi

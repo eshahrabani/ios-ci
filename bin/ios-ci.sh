@@ -393,6 +393,12 @@ report() {
     note "  xcode    : $(sed -n 's/^xcode: //p' "$summary" | head -1 | sed 's/ *$//')"
     if [[ -n "$manual" && "$manual" != "0" ]]; then note "  duration : ${manual} min"; fi
   fi
+  if [[ -f "$out/ci-logs/tailscale-setup.log" ]]; then
+    local ts_err
+    ts_err=$(grep -iE 'invalid key|expired|denied|approval|failed to connect|error' \
+      "$out/ci-logs/tailscale-setup.log" 2>/dev/null | tail -1)
+    if [[ -n "$ts_err" ]]; then note "  tailnet  : ${ts_err}"; fi
+  fi
   if [[ -f "$out/ci-logs/maestro.log" ]]; then
     note "  flow     : $(grep -E 'Flow (Passed|Failed)|flow passed|flow failed' "$out/ci-logs/maestro.log" | tail -1 || echo 'see maestro.log')"
   fi

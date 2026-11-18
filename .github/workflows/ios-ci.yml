@@ -390,6 +390,10 @@ jobs:
           sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
 
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
+          # `launchctl load` alone leaves 5900 closed on macOS 26 (measured on both
+          # hosted images): the daemon needs the launchd override plus a kickstart.
+          sudo launchctl enable system/com.apple.screensharing
+          sudo launchctl kickstart -k system/com.apple.screensharing
           sudo "$KICKSTART" -restart -agent -console
 
           for _ in $(seq 1 30); do

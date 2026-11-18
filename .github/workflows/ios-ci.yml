@@ -157,7 +157,7 @@ jobs:
               echo "not an OAuth client secret, from https://login.tailscale.com/admin/settings/keys"
               # Identifies the credential type without revealing it: tskey-auth-… is an
               # auth key, tskey-client-… an OAuth client secret, tskey-api-… an API token.
-              echo "stored value: ${#TAILSCALE_AUTH_KEY} chars, starts with '${TAILSCALE_AUTH_KEY:0:12}'"
+              echo "stored value: ${#TAILSCALE_AUTH_KEY} chars, starts with '${TAILSCALE_AUTH_KEY:0:12}'" | tee -a "$LOG"
             fi
             exit 1
           fi

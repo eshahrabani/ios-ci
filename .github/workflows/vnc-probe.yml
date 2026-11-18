@@ -1,0 +1,42 @@
+name: vnc-probe
+run-name: vnc step probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-26-intel
+    timeout-minutes: 12
+    steps:
+      - name: Run the desktop step's commands with tracing
+        env:
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+        run: |
+          set -uo pipefail
+          K=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          VNC_USER=tester
+          step() { local name="$1"; shift; echo "== $name"; "$@"; echo "   exit=$?"; }
+
+          echo "console: $(stat -f%Su /dev/console) whoami: $(whoami) pwlen ${#VNC_USER_PASSWORD}"
+          step "list users" dscl . -list /Users
+          if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
+            step "sysadminctl addUser" timeout 180 sudo sysadminctl -addUser "$VNC_USER" \
+              -fullName "iOS CI tester" -password "$VNC_USER_PASSWORD" -admin
+          fi
+          step "authonly" timeout 30 dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD"
+          step "allowAccessFor specified" timeout 60 sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers
+          step "grant user" timeout 120 sudo "$KICKSTART" -activate -configure -access -on \
+            -users "$VNC_USER" -privs -all -restart -agent -console
+          step "launchctl enable" sudo launchctl enable system/com.apple.screensharing
+          step "launchctl load" sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist
+          step "launchctl kickstart" sudo launchctl kickstart -k system/com.apple.screensharing
+          step "kickstart restart" sudo "$KICKSTART" -restart -agent -console
+          sleep 6
+          echo "== listeners"; sudo lsof -iTCP:5900 -sTCP:LISTEN || echo "   none"
+          echo "== tailscale"; tailscale ip -4; tailscale status --json | jq -r '.Self.DNSName'
+          echo "== access list"; sudo "$KICKSTART" -configure -list -access -privs 2>&1 | head -5 || true
+          true

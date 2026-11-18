@@ -334,9 +334,8 @@ cmd_run() {
         if [[ -n "$vnc_address" ]]; then
           manual_ready=true
           note "manual : VNC desktop ready at $vnc_address"
-          note "         sign in as ${ready_user:-tester} with the VNC_USER_PASSWORD secret"
-          note "         use an Apple-ARD client: iVNC (Linux/Windows/macOS) or macOS Screen Sharing"
-          note "         Remmina/TigerVNC cannot authenticate: macOS 26 offers Apple auth only"
+          note "         password: the 8-character VNC_PASSWORD secret; no username"
+          note "         any VNC client works: legacy VNC auth reaches the console desktop"
         fi
       fi
     fi

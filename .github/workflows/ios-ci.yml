@@ -359,67 +359,36 @@ jobs:
           RUN_ID: ${{ github.run_id }}
           APP_REPO: ${{ secrets.APP_REPO }}
           APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
-          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
           MANUAL_MINUTES: ${{ inputs.manual_minutes }}
         run: |
           set -euo pipefail
           LOGS="$RUNNER_TEMP/ci-logs"
           mkdir -p "$LOGS"
-          # Every line of this step lands in ci-logs: the run's own log is deleted when
-          # the job ends, so a failure here would otherwise leave no reason behind.
+          # Every line lands in ci-logs: the public step log is deleted when the job
+          # ends, so a failure here would otherwise leave no reason behind.
           exec > >(tee -a "$LOGS/vnc-step.log") 2>&1
 
-          # A sleeping display is a black screen on a VNC client; forbid display and
-          # system sleep outright, not just with a caffeinate assertion.
+          if [[ ${#VNC_PASSWORD} -lt 8 ]]; then
+            echo "VNC_PASSWORD must be at least 8 characters (legacy VNC uses the first 8)"
+            exit 1
+          fi
+          # A sleeping display is a black screen on a VNC client.
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
+          caffeinate -u -t 2 || true
 
-          if [[ -z "$VNC_USER_PASSWORD" ]]; then
-            echo "VNC_USER_PASSWORD is empty"
-            exit 1
-          fi
-
-          caffeinate -u -t 1 || true
-
-          # macOS 26 Screen Sharing advertises legacy VNC auth (RFB type 2) but drops
-          # the connection when a client selects it (measured at 003.008 and 003.889,
-          # with every password store), and the runner account carries a Secure Token
-          # so its password cannot be set. The credential that works is an account
-          # password via Apple auth (type 30), so create a dedicated admin account and
-          # prove it accepts the secret before publishing an address.
-          # Screen Sharing attaches to the console session. Authenticating as any other
-          # account makes macOS create a second session, and the tester sees black while
-          # its WindowServer starts (measured: console user runner, auth as tester, then
-          # a blank framebuffer and a dropped connection). The account that works is the
-          # one that owns /dev/console, so give it a known password; fall back to a
-          # dedicated account only if that is impossible.
-          # Do not use `timeout`: macOS ships no such command (exit 127). Stdin is
-          # closed so a prompting command fails fast instead of blocking.
-          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
-          echo "console user: ${CONSOLE_USER}"
-          VNC_USER=tester
-          if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
-            if ! sudo sysadminctl -addUser "$VNC_USER" \
-                -fullName "iOS CI tester" -password "$VNC_USER_PASSWORD" -admin </dev/null; then
-              echo "could not create the ${VNC_USER} account"
-              exit 1
-            fi
-          fi
-          if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
-            echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
-            exit 1
-          fi
-
-          # Legacy VNC auth (RFB type 2) needs no account: the server checks an
-          # 8-character password from /Library/Preferences/com.apple.VNCSettings.txt
-          # and attaches the client to the console session, which is the desktop the
-          # screenshots show. Apple auth instead creates a session per user, and a new
-          # session renders black on this VM.
-          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
+          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          # Legacy VNC auth needs no account: the server checks an 8-character password
+          # and attaches the client to the console session, whose desktop is the one
+          # captured below. Apple auth instead creates a session for the authenticated
+          # account, and such a session renders black on this VM (measured).
           sudo "$KICKSTART" -activate -configure -access -on \
             -allowAccessFor -allUsers -privs -all \
             -clientopts -setvnclegacy -vnclegacy yes \
             -restart -agent -console </dev/null
-          sudo "$KICKSTART" -activate </dev/null
+
+          # The legacy password: first 8 characters, XORed with Apple's fixed key and
+          # stored as hex in VNCSettings.
           printf '%s' "$VNC_PASSWORD" | perl -we '
             BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }
             $_ = <STDIN>;
@@ -430,35 +399,14 @@ jobs:
             print "\n"' \
             | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
           sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
-          sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 || true
-          sudo "$KICKSTART" -restart -agent -console </dev/null || true
-          sleep 3
-          echo "advertised security types are logged by the probe below"
-          # Prove what the desk actually shows: the console framebuffer, captured as the
-          # logged-in user, is published with the address so a black client is not the
-          # only evidence available.
-          sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop-console.png" 2>&1 || true
-          echo "note: if the first connection drops, reconnect - macOS switched the console to ${VNC_USER}"
 
-          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          # Grant the account explicitly: with "all users" macOS still refuses some
-          # accounts at the ARD authorization step even though the password is right.
-          # kickstart needs -allowAccessFor -specifiedUsers before -users, or it
-          # rejects the invocation and the step dies under `set -e`.
-          sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null
-          sudo "$KICKSTART" -activate -configure -access -on \
-            -users "$VNC_USER" -privs -all \
-            -restart -agent -console </dev/null
-          sudo launchctl enable system/com.apple.screensharing
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-          sudo launchctl kickstart -k system/com.apple.screensharing
-          sudo "$KICKSTART" -restart -agent -console
-          # The desktop is announced before the smoke test runs, so keep the display
-          # awake from here: a sleeping display would greet the tester with black.
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
+          sudo "$KICKSTART" -restart -agent -console </dev/null || true
           caffeinate -d -i -m -s -u -t 7200 &
 
           for _ in $(seq 1 30); do
-            if sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then break; fi
+            sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1 && break
             sleep 1
           done
           if ! sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
@@ -472,24 +420,23 @@ jobs:
             sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
           fi
 
-          # The Tailscale MagicDNS name is the private address the tester connects to.
-          # `|| true` so a failing probe lands in the diagnostic below instead of
-          # aborting under `set -e`; `head -1` can also SIGPIPE the producer.
+          # Evidence that the desk exists, published with the address: the console
+          # framebuffer captured as the logged-in user.
+          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
+          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
+          echo "console user: ${CONSOLE_USER}"
+          sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop.png" 2>&1 || true
+
+          # The tailnet IP resolves everywhere; MagicDNS only for clients whose resolver
+          # uses Tailscale's, which a tester's Linux box often does not.
           TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
           TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
-          # The tailnet IP resolves everywhere; MagicDNS only works for clients whose
-          # resolver uses Tailscale's, which a tester's Linux box often does not.
           VNC_ADDRESS="${TS_IP:-$TS_DNS}:5900"
           if [[ "$VNC_ADDRESS" == ":5900" ]]; then
             echo "could not determine the Tailscale address"
             tailscale status || true
             exit 1
           fi
-
-          caffeinate -u -t 3 || true
-          echo "console user: $(stat -f%Su /dev/console 2>&1)"
-          echo "display: $(ioreg -n IODisplayWrangler -r -d 1 2>/dev/null | grep -i powerstate | head -1)"
-          pmset -g assertions 2>/dev/null | grep -Ei 'display|sleep' | head -4 || true
 
           {
             echo "run_id: ${RUN_ID}"
@@ -501,8 +448,8 @@ jobs:
             echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           } > "$LOGS/manual-ready.txt"
 
-          # Publish the address through the private app repo; the deploy key exists
-          # only for this push and is removed before the manual hold.
+          # Publish through the private app repo; the deploy key exists only for this
+          # push and is removed before the manual hold.
           KEY="$RUNNER_TEMP/manual_key"
           trap 'rm -f "$KEY"' EXIT
           printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
@@ -513,18 +460,14 @@ jobs:
           mkdir -p "$TMP/ci-logs"
           cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
           cp "$LOGS/vnc-step.log" "$TMP/ci-logs/vnc-step.log"
-          cp "$LOGS"/desktop-*.png "$TMP/ci-logs/" 2>/dev/null || true
+          cp "$LOGS"/desktop.png "$TMP/ci-logs/" 2>/dev/null || true
           git -C "$TMP" init -q
           git -C "$TMP" config user.name ios-ci
           git -C "$TMP" config user.email ios-ci@users.noreply.github.com
           git -C "$TMP" add ci-logs/manual-ready.txt ci-logs/vnc-step.log
-          git -C "$TMP" add ci-logs/desktop-*.png 2>/dev/null || true
+          git -C "$TMP" add ci-logs/desktop.png 2>/dev/null || true
           git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
-          if ! git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs \
-               2>&1 | tee -a "$LOGS/vnc-publish.log"; then
-            echo "could not publish the address to the private repo"
-            exit 1
-          fi
+          git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs
           echo "VNC_READY=1" >> "$GITHUB_ENV"
           echo "VNC_ADDRESS=${VNC_ADDRESS}" >> "$GITHUB_ENV"
           echo "remote desktop ready; address published to the private ci-logs branch"

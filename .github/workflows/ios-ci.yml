@@ -396,31 +396,43 @@ jobs:
           # closed so a prompting command fails fast instead of blocking.
           CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
           echo "console user: ${CONSOLE_USER}"
-          VNC_USER=""
-          if [[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]]; then
-            sudo sysadminctl -resetPasswordFor "$CONSOLE_USER" \
-              -newPassword "$VNC_USER_PASSWORD" </dev/null 2>&1 || true
-            if dscl . -authonly "$CONSOLE_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
-              VNC_USER="$CONSOLE_USER"
-              echo "${VNC_USER} (the console user) accepts VNC_USER_PASSWORD"
-            else
-              echo "could not set the console user's password; falling back to tester"
-            fi
-          fi
-          if [[ -z "$VNC_USER" ]]; then
-            VNC_USER=tester
-            if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
-              if ! sudo sysadminctl -addUser "$VNC_USER" \
-                  -fullName "iOS CI tester" -password "$VNC_USER_PASSWORD" -admin </dev/null; then
-                echo "could not create the ${VNC_USER} account"
-                exit 1
-              fi
-            fi
-            if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
-              echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
+          VNC_USER=tester
+          if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
+            if ! sudo sysadminctl -addUser "$VNC_USER" \
+                -fullName "iOS CI tester" -password "$VNC_USER_PASSWORD" -admin </dev/null; then
+              echo "could not create the ${VNC_USER} account"
               exit 1
             fi
           fi
+          if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
+            echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
+            exit 1
+          fi
+
+          # The console session decides which desktop a client sees, and a client that
+          # authenticates as another account gets a new session whose WindowServer is
+          # still starting: black, then dropped. Make the console belong to the tester
+          # before anyone connects, by enabling auto-login and logging the current user
+          # out; the loginwindow then signs ${VNC_USER} in by itself.
+          # /etc/kcpassword obfuscates the auto-login password with a fixed key.
+          printf '%s' "$VNC_USER_PASSWORD" | perl -0777 -e '
+            BEGIN { @k = unpack "C*", pack "H*", "7D895223D2BCDDEAA3B91F" }
+            my $s = <STDIN> . "\0";
+            print pack("C*", map { ord(substr($s, $_, 1)) ^ $k[$_ % 11] } 0 .. length($s) - 1);
+          ' | sudo tee /etc/kcpassword >/dev/null
+          sudo chmod 600 /etc/kcpassword
+          sudo chown root:wheel /etc/kcpassword
+          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$VNC_USER"
+          if [[ "$CONSOLE_USER" != "$VNC_USER" ]]; then
+            # The runner agent is a LaunchDaemon, so logging the GUI session out does
+            # not end the job; the auto-login brings ${VNC_USER} up in its place.
+            sudo launchctl bootout "gui/$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)" 2>&1 || true
+            for _ in $(seq 1 90); do
+              [[ "$(stat -f%Su /dev/console 2>/dev/null)" == "$VNC_USER" ]] && break
+              sleep 1
+            done
+          fi
+          echo "console user after login: $(stat -f%Su /dev/console 2>/dev/null)"
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
           # Grant the account explicitly: with "all users" macOS still refuses some

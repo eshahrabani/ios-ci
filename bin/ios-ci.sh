@@ -319,12 +319,11 @@ cmd_run() {
         -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
       if [[ -n "$manual_file" ]]; then
         vnc_address=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_address: //p' | head -1)
-        vnc_user=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_user: //p' | head -1)
         if [[ -n "$vnc_address" ]]; then
           manual_ready=true
           note "manual : VNC desktop ready at $vnc_address"
-          note "         VNC password: the 8-character VNC_PASSWORD secret"
-          note "         Apple Screen Sharing / RealVNC: user ${vnc_user:-runner}, password VNC_USER_PASSWORD"
+          note "         password: the 8-character VNC_PASSWORD secret (standard VNC auth)"
+          note "         any VNC client works: Apple Screen Sharing, RealVNC, TigerVNC, Remmina"
         fi
       fi
     fi

@@ -361,7 +361,9 @@ jobs:
           # aborting under `set -e`; `head -1` can also SIGPIPE the producer.
           TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
           TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
-          VNC_ADDRESS="${TS_DNS:-$TS_IP}:5900"
+          # The tailnet IP resolves everywhere; MagicDNS only works for clients whose
+          # resolver uses Tailscale's, which a tester's Linux box often does not.
+          VNC_ADDRESS="${TS_IP:-$TS_DNS}:5900"
           if [[ "$VNC_ADDRESS" == ":5900" ]]; then
             echo "could not determine the Tailscale address"
             tailscale status || true
@@ -371,6 +373,7 @@ jobs:
           {
             echo "run_id: ${RUN_ID}"
             echo "vnc_address: ${VNC_ADDRESS}"
+            echo "vnc_dns: ${TS_DNS}:5900"
             echo "vnc_user: ${RUNNER_USER}"
             echo "session_minutes: ${MANUAL_MINUTES}"
             echo "vnc_auth: apple"
@@ -393,12 +396,17 @@ jobs:
           git -C "$TMP" config user.email ios-ci@users.noreply.github.com
           git -C "$TMP" add ci-logs/manual-ready.txt
           git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
-          git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs
+          if ! git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs \
+               2>&1 | tee -a "$LOGS/vnc-publish.log"; then
+            echo "could not publish the address to the private repo"
+            exit 1
+          fi
           echo "VNC_READY=1" >> "$GITHUB_ENV"
           echo "VNC_ADDRESS=${VNC_ADDRESS}" >> "$GITHUB_ENV"
           echo "remote desktop ready; address published to the private ci-logs branch"
 
       - name: Install Maestro
+        if: always() && steps.boot.outcome == 'success'
         timeout-minutes: 5
         env:
           MAESTRO_VERSION: 2.12.1

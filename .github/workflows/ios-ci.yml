@@ -409,30 +409,11 @@ jobs:
             exit 1
           fi
 
-          # The console session decides which desktop a client sees, and a client that
-          # authenticates as another account gets a new session whose WindowServer is
-          # still starting: black, then dropped. Make the console belong to the tester
-          # before anyone connects, by enabling auto-login and logging the current user
-          # out; the loginwindow then signs ${VNC_USER} in by itself.
-          # /etc/kcpassword obfuscates the auto-login password with a fixed key.
-          printf '%s' "$VNC_USER_PASSWORD" | perl -0777 -e '
-            BEGIN { @k = unpack "C*", pack "H*", "7D895223D2BCDDEAA3B91F" }
-            my $s = <STDIN> . "\0";
-            print pack("C*", map { ord(substr($s, $_, 1)) ^ $k[$_ % 11] } 0 .. length($s) - 1);
-          ' | sudo tee /etc/kcpassword >/dev/null
-          sudo chmod 600 /etc/kcpassword
-          sudo chown root:wheel /etc/kcpassword
-          sudo defaults write /Library/Preferences/com.apple.loginwindow autoLoginUser -string "$VNC_USER"
-          if [[ "$CONSOLE_USER" != "$VNC_USER" ]]; then
-            # The runner agent is a LaunchDaemon, so logging the GUI session out does
-            # not end the job; the auto-login brings ${VNC_USER} up in its place.
-            sudo launchctl bootout "gui/$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)" 2>&1 || true
-            for _ in $(seq 1 90); do
-              [[ "$(stat -f%Su /dev/console 2>/dev/null)" == "$VNC_USER" ]] && break
-              sleep 1
-            done
-          fi
-          echo "console user after login: $(stat -f%Su /dev/console 2>/dev/null)"
+          # The console session decides which desktop a client sees: with a different
+          # account, the first connection makes macOS switch the console (fast user
+          # switching) and drops that connection; the next one attaches to the session
+          # that now exists. Publishing that fact saves the tester a guess.
+          echo "note: if the first connection drops, reconnect - macOS switched the console to ${VNC_USER}"
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
           # Grant the account explicitly: with "all users" macOS still refuses some

@@ -121,20 +121,38 @@ jobs:
           RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+          LOG="$LOGS/tailscale-setup.log"
+          # Published with ci-logs: the public step log is deleted when the run ends, so
+          # a failed join would otherwise leave no reason behind.
+          step() { echo "+ $*" ; "$@" 2>&1 | tee -a "$LOG" ; }
+
           if [[ -z "$TAILSCALE_AUTH_KEY" ]]; then
-            echo "TAILSCALE_AUTH_KEY is empty"
+            echo "TAILSCALE_AUTH_KEY is empty" | tee -a "$LOG"
             exit 1
           fi
-          brew install tailscale
+          step brew install tailscale
           TS_PREFIX=$(brew --prefix)
           echo "$TS_PREFIX/bin" >> "$GITHUB_PATH"
-          sudo "$TS_PREFIX/bin/tailscaled" install-system-daemon
+          step sudo "$TS_PREFIX/bin/tailscaled" install-system-daemon
+
+          # install-system-daemon returns before the socket answers; `up` would fail
+          # with "failed to connect to local tailscaled" if it ran immediately.
+          for _ in $(seq 1 30); do
+            if "$TS_PREFIX/bin/tailscale" status --json 2>/dev/null | jq -e . >/dev/null 2>&1; then
+              echo "daemon ready after ${_}s" | tee -a "$LOG"
+              break
+            fi
+            sleep 1
+          done
+
           # `up` has no --ephemeral flag: ephemerality is a property of the auth key.
-          sudo "$TS_PREFIX/bin/tailscale" up \
+          step sudo "$TS_PREFIX/bin/tailscale" up \
             --authkey="$TAILSCALE_AUTH_KEY" \
             --hostname="ios-ci-${RUN_ID}" \
             --timeout=120s
-          tailscale status | head -5
+          "$TS_PREFIX/bin/tailscale" status 2>&1 | tee -a "$LOG" || true
 
       - name: Select Xcode
         run: |

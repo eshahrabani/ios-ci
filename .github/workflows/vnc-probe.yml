@@ -12,97 +12,34 @@ jobs:
     runs-on: macos-26-intel
     timeout-minutes: 15
     steps:
-      - name: Which legacy password store authenticates
+      - name: Which account credential can be set
         env:
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          PW: ${{ secrets.VNC_USER_PASSWORD }}
         run: |
           set +e
           set -uo pipefail
-          K=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
-          PREF=/Library/Preferences/com.apple.RemoteManagement.plist
-          VNC8=${VNC_PASSWORD:0:8}
-          MD5HEX=$(printf '%s' "$VNC8" | md5 -q)
-          echo "secret length ${#VNC_PASSWORD}, first8 length ${#VNC8}"
-
-          cat > "$RUNNER_TEMP/vnc_auth.py" <<'PY'
-          import os, socket, subprocess, sys
-          def readn(s, n):
-              buf = b""
-              while len(buf) < n:
-                  c = s.recv(n - len(buf))
-                  if not c: raise EOFError(f"closed after {len(buf)}/{n}")
-                  buf += c
-              return buf
-          def des_ecb(key, block):
-              for extra in ([], ["-provider","legacy","-provider","default"]):
-                  p = subprocess.run(["openssl","enc","-des-ecb",*extra,"-K",key.hex(),"-nopad"],
-                                     input=block, capture_output=True)
-                  if p.returncode == 0 and len(p.stdout) == 16: return p.stdout
-              sys.exit("no DES-ECB")
-          pw = os.environ["VNC8"].encode()
-          if len(pw) != 8: sys.exit(f"password not 8 bytes: {len(pw)}")
-          key = bytes(int(f"{b:08b}"[::-1], 2) for b in pw)
-          s = socket.create_connection(("127.0.0.1", 5900), 10); s.settimeout(10)
-          b = readn(s, 12)
-          if not b.startswith(b"RFB "): sys.exit(f"banner {b!r}")
-          s.sendall(os.environ.get("VNC_VER", "003.889").encode().join([b"RFB ", b"\n"]))
-          n = readn(s, 1)[0]
-          if n == 0:
-              size = int.from_bytes(readn(s, 4), "big")
-              sys.exit("refused: " + readn(s, size).decode(errors="replace"))
-          types = list(readn(s, n))
-          print("  types:", types)
-          if 2 not in types: sys.exit("  no type 2")
-          s.sendall((2).to_bytes(4, "big"))
-          s.sendall(des_ecb(key, readn(s, 16)))
-          result = int.from_bytes(readn(s, 4), "big")
-          print("  result:", result, "PASS" if result == 0 else "FAIL")
-          sys.exit(0)
-          PY
-
-          check() {
-            echo "== $1"
-            for ver in 003.008 003.889; do
-              echo "  -- version $ver, wrong password"
-              VNC_VER="$ver" VNC8=zzzzzzzz python3 "$RUNNER_TEMP/vnc_auth.py" 2>&1 | grep -E 'types|result|closed|refused|no type' | sed 's/^/     /'
-              echo "  -- version $ver, real password"
-              VNC_VER="$ver" VNC8="$VNC8" python3 "$RUNNER_TEMP/vnc_auth.py" 2>&1 | grep -E 'types|result|closed|refused|no type' | sed 's/^/     /'
-            done
+          echo "console user: $(stat -f%Su /dev/console)  whoami: $(whoami)  pw length: ${#PW}"
+          try() {
+            local name="$1"; shift
+            echo "== $name"
+            "$@" 2>&1 | tail -3 | sed 's/^/   out: /'
+            if dscl . -authonly runner "$PW" 2>/dev/null; then
+              echo "   runner authonly: OK"
+            else
+              echo "   runner authonly: FAILED"
+            fi
           }
 
-          caffeinate -u -t 1 || true
-          sudo "$K" -activate -configure -access -on -allowAccessFor -allUsers -privs -all \
-            -clientopts -setvnclegacy -vnclegacy yes 2>&1 | tail -3
-          sudo launchctl enable system/com.apple.screensharing
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>&1 | tail -2
-          sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 | tail -2
-          sleep 6
-          sudo lsof -iTCP:5900 -sTCP:LISTEN | head -3
+          try "dscl passwd"                sudo dscl . -passwd /Users/runner "$PW"
+          try "dscl passwd (empty old)"    sudo dscl . -passwd /Users/runner "" "$PW"
+          try "passwd as root (stdin)"     bash -c 'printf "%s\n%s\n" "$PW" "$PW" | sudo passwd runner'
+          try "sysadminctl reset (admin=runner, old empty)" \
+              sudo sysadminctl -resetPasswordFor runner -newPassword "$PW" -adminUser runner -adminPassword ""
+          try "sysadminctl off"            sudo sysadminctl -off
 
-          check "after kickstart only"
-
-          printf '%s' "$VNC_PASSWORD" | perl -we '
-            BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }
-            $_ = <>;
-            chomp;
-            s/^(.{8}).*/$1/;
-            @p = unpack "C*", $_;
-            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }
-            print "\n"' | sudo tee /Library/Preferences/com.apple.VNCSettings.txt
-          sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
-          sudo launchctl kickstart -k system/com.apple.screensharing; sleep 4
-          check "after VNCSettings.txt"
-
-          sudo /usr/libexec/PlistBuddy -c "Delete :VNCLegacyPasswords" "$PREF" 2>/dev/null
-          sudo /usr/libexec/PlistBuddy -c "Add :VNCLegacyPasswords array" "$PREF"
-          sudo /usr/libexec/PlistBuddy -c "Add :VNCLegacyPasswords:0 string $MD5HEX" "$PREF"
-          sudo launchctl kickstart -k system/com.apple.screensharing; sleep 4
-          echo "plist now: $(sudo defaults read /Library/Preferences/com.apple.RemoteManagement 2>/dev/null | grep -A2 VNCLegacyPasswords | tr '\n' ' ')"
-          check "after VNCLegacyPasswords string"
-
-          sudo /usr/libexec/PlistBuddy -c "Delete :VNCLegacyPasswords" "$PREF" 2>/dev/null
-          sudo /usr/libexec/PlistBuddy -c "Add :VNCLegacyPasswords array" "$PREF"
-          sudo /usr/libexec/PlistBuddy -c "Add :VNCLegacyPasswords:0 data $(printf '%s' "$MD5HEX" | xxd -r -p | base64)" "$PREF"
-          sudo launchctl kickstart -k system/com.apple.screensharing; sleep 4
-          check "after VNCLegacyPasswords data"
+          echo "== create tester admin user"
+          sudo sysadminctl -addUser tester -fullName "VNC Tester" -password "$PW" -admin 2>&1 | tail -3 | sed 's/^/   out: /'
+          if dscl . -authonly tester "$PW" 2>/dev/null; then echo "   tester authonly: OK"; else echo "   tester authonly: FAILED"; fi
+          echo "== users: $(dscl . -list /Users | grep -v '^_' | tr '\n' ' ')"
+          echo "== runner record: $(sudo dscl . -read /Users/runner AuthenticationAuthority 2>&1 | head -2 | tr '\n' ' ')"
           true

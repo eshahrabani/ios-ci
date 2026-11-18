@@ -52,10 +52,10 @@ options:
 
 manual sessions:
   the tester's machine must be on the same Tailscale tailnet. Repo secrets:
-  TAILSCALE_AUTH_KEY (a reusable auth key: tskey-auth-…) plus VNC_PASSWORD (exactly
-  8 characters) and VNC_USER_PASSWORD. The desktop offers standard VNC auth, so any
-  VNC client works with VNC_PASSWORD; the account password is only attempted, since
-  macOS 26 refuses to set it.
+  TAILSCALE_AUTH_KEY (a reusable auth key: tskey-auth-…) and VNC_USER_PASSWORD.
+  The desktop is reached as the `tester` account with VNC_USER_PASSWORD, using Apple
+  Screen Sharing authentication (macOS Screen Sharing, RealVNC, Jump). Remmina,
+  TigerVNC and other plain-VNC clients cannot authenticate to macOS 26.
   The CLI prints the VNC address when the desktop is ready. --manual accepts 1-300
   minutes; the hosted job cap is 360.
 
@@ -270,7 +270,7 @@ cmd_run() {
   if [[ "$MANUAL_MINUTES" != "0" ]]; then
     local secret_names
     if secret_names=$(gh secret list --repo "$RUNNER_REPO" --json name --jq '.[].name' 2>/dev/null); then
-      for s in TAILSCALE_AUTH_KEY VNC_PASSWORD VNC_USER_PASSWORD; do
+      for s in TAILSCALE_AUTH_KEY VNC_USER_PASSWORD; do
         grep -qx "$s" <<<"$secret_names" || die "missing secret $s on $RUNNER_REPO.
      set it with: gh secret set $s --repo $RUNNER_REPO"
       done
@@ -316,7 +316,7 @@ cmd_run() {
   local status conclusion elapsed=0
   while [[ "$elapsed" -lt $((TIMEOUT_MIN * 60)) ]]; do
     if [[ "$MANUAL_MINUTES" != "0" && "$manual_ready" != true ]]; then
-      local manual_file vnc_address ready_run
+      local manual_file vnc_address ready_run ready_user
       manual_file=$(gh api "repos/$app/contents/ci-logs/manual-ready.txt?ref=ci-logs" \
         -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
       if [[ -n "$manual_file" ]]; then
@@ -327,11 +327,13 @@ cmd_run() {
       fi
       if [[ -n "$manual_file" ]]; then
         vnc_address=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_address: //p' | head -1)
+        ready_user=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_user: //p' | head -1)
         if [[ -n "$vnc_address" ]]; then
           manual_ready=true
           note "manual : VNC desktop ready at $vnc_address"
-          note "         password: the 8-character VNC_PASSWORD secret (standard VNC auth)"
-          note "         any VNC client works: Apple Screen Sharing, RealVNC, TigerVNC, Remmina"
+          note "         sign in as ${ready_user:-tester} with the VNC_USER_PASSWORD secret"
+          note "         client must do Apple Screen Sharing auth: macOS Screen Sharing, RealVNC, Jump"
+          note "         Remmina/TigerVNC cannot authenticate: macOS 26 offers Apple auth only"
         fi
       fi
     fi

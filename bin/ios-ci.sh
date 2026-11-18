@@ -51,11 +51,13 @@ options:
   -h, --help          this text
 
 manual sessions:
-  the tester's machine must be on the same Tailscale tailnet; set repo secrets
-  TAILSCALE_AUTH_KEY, VNC_PASSWORD (8 characters) and VNC_USER_PASSWORD.
-  The CLI prints the VNC address when the desktop is ready; connect with any VNC
-  client using VNC_PASSWORD. --manual accepts 1-300 minutes; the hosted job cap is
-  360.
+  the tester's machine must be on the same Tailscale tailnet. Repo secrets:
+  TAILSCALE_AUTH_KEY (a reusable auth key: tskey-auth-…) plus VNC_PASSWORD (exactly
+  8 characters) and VNC_USER_PASSWORD. The desktop offers standard VNC auth, so any
+  VNC client works with VNC_PASSWORD; the account password is only attempted, since
+  macOS 26 refuses to set it.
+  The CLI prints the VNC address when the desktop is ready. --manual accepts 1-300
+  minutes; the hosted job cap is 360.
 
 examples:
   ios-ci.sh prepare && ios-ci.sh run
@@ -314,7 +316,7 @@ cmd_run() {
   local status conclusion elapsed=0
   while [[ "$elapsed" -lt $((TIMEOUT_MIN * 60)) ]]; do
     if [[ "$MANUAL_MINUTES" != "0" && "$manual_ready" != true ]]; then
-      local manual_file vnc_address vnc_user
+      local manual_file vnc_address
       manual_file=$(gh api "repos/$app/contents/ci-logs/manual-ready.txt?ref=ci-logs" \
         -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
       if [[ -n "$manual_file" ]]; then

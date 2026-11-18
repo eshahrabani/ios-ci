@@ -108,13 +108,33 @@ jobs:
           echo "removed ${removed} key file(s) from RUNNER_TEMP"
 
       # Manual runs expose Screen Sharing (VNC) to the tester's private tailnet only.
-      # The action creates an ephemeral node; it leaves the tailnet when the job ends.
-      # VNC is never published to the internet.
+      # The repo's Actions policy allows only GitHub-owned actions, and Tailscale's
+      # macOS support builds from source, so the client comes from Homebrew instead: a
+      # bottle on both hosted macOS images (measured: ~8 s) with a system daemon that
+      # outlives this step. The node leaves the tailnet when the job ends; VNC is never
+      # published to the internet.
       - name: Connect Tailscale
         if: inputs.manual_minutes != '0'
-        uses: tailscale/github-action@v4
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        timeout-minutes: 10
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$TAILSCALE_AUTH_KEY" ]]; then
+            echo "TAILSCALE_AUTH_KEY is empty"
+            exit 1
+          fi
+          brew install tailscale
+          TS_PREFIX=$(brew --prefix)
+          echo "$TS_PREFIX/bin" >> "$GITHUB_PATH"
+          sudo "$TS_PREFIX/bin/tailscaled" install-system-daemon
+          # `up` has no --ephemeral flag: ephemerality is a property of the auth key.
+          sudo "$TS_PREFIX/bin/tailscale" up \
+            --authkey="$TAILSCALE_AUTH_KEY" \
+            --hostname="ios-ci-${RUN_ID}" \
+            --timeout=120s
+          tailscale status | head -5
 
       - name: Select Xcode
         run: |
@@ -498,11 +518,50 @@ jobs:
             open app/ios/App/App.xcodeproj 2>/dev/null || true
           fi
           echo "Manual session open for ${MANUAL_MINUTES} minutes; connect over VNC."
+          # Keep the display awake and the session unlocked for the whole hold: the
+          # runner account password cannot be set on macOS 26 (dscl wants the old one),
+          # so a locked screen would be unrecoverable.
+          caffeinate -d -i -m -s -u -t $(( 10#${MANUAL_MINUTES} * 60 + 300 )) &
           sleep $(( 10#${MANUAL_MINUTES} * 60 ))
           if [[ -n "${UDID:-}" ]]; then
             xcrun simctl io "$UDID" screenshot "$LOGS/manual-end.png" >/dev/null 2>&1 || true
           fi
           echo "ended: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$LOGS/manual-session.txt"
+
+      # The public run's logs are deleted by cleanup.yml as soon as the job ends, so a
+      # failed manual step would leave nothing behind. Record the state that decides
+      # whether the desktop was usable into ci-logs, which is published below.
+      - name: Manual diagnostics
+        if: always() && inputs.manual_minutes != '0'
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set +e
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+          TS=$(brew --prefix 2>/dev/null)/bin/tailscale
+          {
+            echo "run_id: ${RUN_ID:-unknown}"
+            echo "console_user: $(stat -f%Su /dev/console 2>&1)"
+            echo
+            echo "== tailscale"
+            if [[ -x "$TS" ]]; then "$TS" status 2>&1 | head -30; else echo "not installed"; fi
+            echo
+            echo "== screen"
+            python3 - <<'PY' 2>&1 | head -5
+          import Quartz
+          d = Quartz.CGSessionCopyCurrentDictionary()
+          print(dict(d) if d else "no session")
+          PY
+            echo
+            echo "== listeners"
+            sudo lsof -iTCP -sTCP:LISTEN 2>&1 | head -20
+            echo
+            echo "== settings"
+            sudo ls -l /Library/Preferences/com.apple.VNCSettings.txt 2>&1
+            sudo defaults read /Library/Preferences/com.apple.RemoteManagement 2>&1 | grep -E 'VNCLegacy|ARD_All' 
+          } > "$LOGS/manual-diagnostics.txt" 2>&1
+          true
 
       - name: Clean up manual session
         if: always() && inputs.manual_minutes != '0'
@@ -511,6 +570,10 @@ jobs:
           if [[ -n "${UDID:-}" ]]; then xcrun simctl shutdown "$UDID" 2>/dev/null; fi
           killall Simulator 2>/dev/null
           killall Xcode 2>/dev/null
+          # Drop the node from the tailnet now instead of waiting for the ephemeral key
+          # to expire; the VM is destroyed with the job either way.
+          TS=$(brew --prefix 2>/dev/null)/bin/tailscale
+          if [[ -x "$TS" ]]; then sudo "$TS" logout 2>/dev/null; fi
           true
 
       - name: Publish logs to private repo

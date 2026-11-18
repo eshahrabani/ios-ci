@@ -415,6 +415,13 @@ jobs:
             | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
           sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
 
+          # The daemon refuses to capture unless these are on; with them unset its
+          # checkin line reads "screenCaptureFlag 0" and every client gets a black
+          # framebuffer ("allowRemoteScreenObservation key not set" in its log).
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement.plist \
+            allowRemoteScreenObservation -bool true
+          sudo defaults write /Library/Preferences/com.apple.RemoteManagement.plist \
+            allowScreenShot -bool true
           sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
           sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
           sudo "$KICKSTART" -restart -agent -console </dev/null || true
@@ -450,6 +457,9 @@ jobs:
             dscl . -read /Users/runner AuthenticationAuthority 2>&1 | head -4
             echo "== empty password probe"
             dscl . -authonly runner "" </dev/null 2>&1 || echo "empty rejected"
+            echo "== capture flag"
+            sudo log show --predicate 'process == "screensharingd"' --last 2m 2>/dev/null \
+              | grep -E 'SSDaemon_Checkin|allowRemoteScreenObservation' | tail -3
             echo "== screensharingd log"
             sudo log show --predicate 'process == "screensharingd"' --last 5m 2>/dev/null | tail -40
             echo "== windowserver display"

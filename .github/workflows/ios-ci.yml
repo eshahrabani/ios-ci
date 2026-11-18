@@ -301,6 +301,9 @@ jobs:
           set -euo pipefail
           LOGS="$RUNNER_TEMP/ci-logs"
           mkdir -p "$LOGS"
+          # Every line of this step lands in ci-logs: the run's own log is deleted when
+          # the job ends, so a failure here would otherwise leave no reason behind.
+          exec > >(tee -a "$LOGS/vnc-step.log") 2>&1
 
           if [[ -z "$VNC_USER_PASSWORD" ]]; then
             echo "VNC_USER_PASSWORD is empty"
@@ -333,6 +336,9 @@ jobs:
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
           # Grant the account explicitly: with "all users" macOS still refuses some
           # accounts at the ARD authorization step even though the password is right.
+          # kickstart needs -allowAccessFor -specifiedUsers before -users, or it
+          # rejects the invocation and the step dies under `set -e`.
+          timeout 60 sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null
           timeout 120 sudo "$KICKSTART" -activate -configure -access -on \
             -users "$VNC_USER" -privs -all \
             -restart -agent -console </dev/null

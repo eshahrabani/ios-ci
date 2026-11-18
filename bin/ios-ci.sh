@@ -316,9 +316,15 @@ cmd_run() {
   local status conclusion elapsed=0
   while [[ "$elapsed" -lt $((TIMEOUT_MIN * 60)) ]]; do
     if [[ "$MANUAL_MINUTES" != "0" && "$manual_ready" != true ]]; then
-      local manual_file vnc_address
+      local manual_file vnc_address ready_run
       manual_file=$(gh api "repos/$app/contents/ci-logs/manual-ready.txt?ref=ci-logs" \
         -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
+      if [[ -n "$manual_file" ]]; then
+        # The branch still holds the previous session's file until this run publishes
+        # its own, and that address points at a VM that no longer exists.
+        ready_run=$(printf '%s\n' "$manual_file" | sed -n 's/^run_id: //p' | head -1)
+        [[ "$ready_run" == "$run_id" ]] || manual_file=""
+      fi
       if [[ -n "$manual_file" ]]; then
         vnc_address=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_address: //p' | head -1)
         if [[ -n "$vnc_address" ]]; then

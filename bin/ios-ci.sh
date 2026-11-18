@@ -46,12 +46,14 @@ options:
                       generated and installed as a write deploy key when missing)
   --runner OWNER/NAME runner repo (default: eshahrabani/ios-ci or $IOS_CI_RUNNER)
   --timeout MIN       minutes to wait for the run (default: 60)
-  --manual MINUTES    hold a hosted VNC desktop for manual testing (1-300)
+  --manual MINUTES    boot a VNC desktop with the app cloned for graphical work (1-300)
   --dry-run           print the commands instead of executing them
   -h, --help          this text
 
 manual sessions:
-  the tester's machine must be on the same Tailscale tailnet. Repo secrets:
+  no build runs: the app is cloned into ~/<app> on the desktop, with Xcode, the iOS
+  simulators, node and yarn ready, so the build happens graphically.
+  The tester's machine must be on the same Tailscale tailnet. Repo secrets:
   TAILSCALE_AUTH_KEY (a reusable auth key: tskey-auth-…) and VNC_USER_PASSWORD.
   The desktop is reached as the `tester` account with VNC_USER_PASSWORD, using Apple
   ARD authentication (RFB type 30): iVNC on Linux/Windows/macOS, or macOS Screen
@@ -262,7 +264,7 @@ cmd_run() {
     note "            -f manual_minutes=$MANUAL_MINUTES"
     note "timeout : ${TIMEOUT_MIN} min"
     if [[ "$MANUAL_MINUTES" != "0" ]]; then
-      note "manual : a hosted VNC desktop for ${MANUAL_MINUTES} min; the address is published to the private ci-logs branch"
+      note "manual : a VNC desktop for ${MANUAL_MINUTES} min, app cloned into ~/<app>; the address is published to the private ci-logs branch"
     fi
     return 0
   fi

@@ -110,6 +110,65 @@ jobs:
           done < <(grep -l -- 'PRIVATE KEY' "$RUNNER_TEMP"/* 2>/dev/null || true)
           echo "removed ${removed} key file(s) from RUNNER_TEMP"
 
+      # Manual runs hand over a desktop, not a build: the app lands in the home
+      # directory and the toolchain is ready, so the build happens graphically.
+      - name: Clone the app for graphical work
+        if: inputs.manual_minutes != '0'
+        timeout-minutes: 15
+        env:
+          APP_REPO: ${{ secrets.APP_REPO }}
+          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
+          APP_SHA: ${{ inputs.sha }}
+        run: |
+          set -euo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+          DEST="$HOME/${APP_REPO#*/}"
+          rm -rf "$DEST"
+          if [[ -n "$APP_DEPLOY_KEY" ]]; then
+            KEY="$RUNNER_TEMP/clone_key"
+            trap 'rm -f "$KEY"' EXIT
+            printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
+            chmod 600 "$KEY"
+            GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/clone_known_hosts" \
+              git clone --quiet "git@github.com:${APP_REPO}.git" "$DEST" >> "$LOGS/clone.log" 2>&1 || true
+          fi
+          if [[ ! -d "$DEST/.git" ]]; then
+            echo "clone unavailable; copying the checked-out tree" >> "$LOGS/clone.log"
+            cp -R "$GITHUB_WORKSPACE/app" "$DEST"
+            git -C "$DEST" remote set-url origin "git@github.com:${APP_REPO}.git" 2>/dev/null || true
+          fi
+          git -C "$DEST" checkout --quiet "$APP_SHA" 2>/dev/null \
+            || echo "warning: could not check out ${APP_SHA:0:7}" >> "$LOGS/clone.log"
+          echo "APP_DIR=$DEST" >> "$GITHUB_ENV"
+          {
+            echo "cloned ${APP_REPO} into ${DEST}"
+            git -C "$DEST" log --oneline -1
+          } >> "$LOGS/clone.log" 2>&1
+          cat "$LOGS/clone.log"
+
+      - name: Prepare the desktop toolchain
+        if: inputs.manual_minutes != '0'
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+          {
+            echo "== xcode"
+            xcodebuild -version
+            echo "== simulators"
+            xcrun simctl list devices available | head -5
+            echo "== node"
+            node --version
+            npm --version
+            echo "== yarn"
+            if ! command -v yarn >/dev/null 2>&1; then
+              npm install -g yarn >/dev/null 2>&1 || corepack enable
+            fi
+            yarn --version
+          } 2>&1 | tee "$LOGS/toolchain.log"
+
       # Manual runs expose Screen Sharing (VNC) to the tester's private tailnet only.
       # The repo's Actions policy allows only GitHub-owned actions, and Tailscale's
       # macOS support builds from source, so the client comes from Homebrew instead: a
@@ -179,6 +238,7 @@ jobs:
           cache-dependency-path: app/package-lock.json
 
       - name: Install web dependencies
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 15
         run: |
@@ -191,6 +251,7 @@ jobs:
           }
 
       - name: Build web assets
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 15
         run: |
@@ -202,6 +263,7 @@ jobs:
           }
 
       - name: Sync Capacitor iOS project
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 10
         run: |
@@ -214,6 +276,7 @@ jobs:
           }
 
       - name: Build for iOS Simulator
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 20
         run: |
@@ -237,6 +300,7 @@ jobs:
             }
 
       - name: Boot simulator and install app
+        if: inputs.manual_minutes == '0'
         id: boot
         working-directory: app
         timeout-minutes: 10
@@ -304,6 +368,10 @@ jobs:
           # Every line of this step lands in ci-logs: the run's own log is deleted when
           # the job ends, so a failure here would otherwise leave no reason behind.
           exec > >(tee -a "$LOGS/vnc-step.log") 2>&1
+
+          # A sleeping display is a black screen on a VNC client; forbid display and
+          # system sleep outright, not just with a caffeinate assertion.
+          sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
 
           if [[ -z "$VNC_USER_PASSWORD" ]]; then
             echo "VNC_USER_PASSWORD is empty"
@@ -379,8 +447,14 @@ jobs:
             exit 1
           fi
 
+          caffeinate -u -t 3 || true
+          echo "console user: $(stat -f%Su /dev/console 2>&1)"
+          echo "display: $(ioreg -n IODisplayWrangler -r -d 1 2>/dev/null | grep -i powerstate | head -1)"
+          pmset -g assertions 2>/dev/null | grep -Ei 'display|sleep' | head -4 || true
+
           {
             echo "run_id: ${RUN_ID}"
+            echo "repo: ${APP_DIR:-}"
             echo "vnc_address: ${VNC_ADDRESS}"
             echo "vnc_dns: ${TS_DNS}:5900"
             echo "vnc_user: ${VNC_USER}"
@@ -400,10 +474,11 @@ jobs:
           rm -rf "$TMP"
           mkdir -p "$TMP/ci-logs"
           cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
+          cp "$LOGS/vnc-step.log" "$TMP/ci-logs/vnc-step.log"
           git -C "$TMP" init -q
           git -C "$TMP" config user.name ios-ci
           git -C "$TMP" config user.email ios-ci@users.noreply.github.com
-          git -C "$TMP" add ci-logs/manual-ready.txt
+          git -C "$TMP" add ci-logs/manual-ready.txt ci-logs/vnc-step.log
           git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
           if ! git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs \
                2>&1 | tee -a "$LOGS/vnc-publish.log"; then
@@ -415,7 +490,7 @@ jobs:
           echo "remote desktop ready; address published to the private ci-logs branch"
 
       - name: Install Maestro
-        if: always() && steps.boot.outcome == 'success'
+        if: always() && inputs.manual_minutes == '0' && steps.boot.outcome == 'success'
         timeout-minutes: 5
         env:
           MAESTRO_VERSION: 2.12.1
@@ -440,7 +515,7 @@ jobs:
         # The desktop is enabled before this step, so the tester can watch the flow and
         # the smoke result must survive a desktop failure; it is still skipped when the
         # simulator never booted.
-        if: always() && steps.boot.outcome == 'success'
+        if: always() && inputs.manual_minutes == '0' && steps.boot.outcome == 'success'
         working-directory: app
         timeout-minutes: 20
         env:
@@ -541,46 +616,21 @@ jobs:
             exit 0
           fi
           caffeinate -u -t 1 || true
-          if [[ -n "${APP_PATH:-}" && -n "${UDID:-}" && -n "${BUNDLE_ID:-}" ]]; then
-            xcrun simctl terminate "$UDID" "$BUNDLE_ID" 2>/dev/null || true
-            xcrun simctl uninstall "$UDID" "$BUNDLE_ID" 2>/dev/null || true
-            xcrun simctl install "$UDID" "$APP_PATH" \
-              || echo "warning: reinstall failed; using the installed build"
-            xcrun simctl launch "$UDID" "$BUNDLE_ID" || true
-            xcrun simctl io "$UDID" screenshot "$LOGS/manual-start.png" >/dev/null 2>&1 || true
-            {
-              echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-              echo "simulator: ${SIMULATOR:-unknown}"
-              echo "bundle_id: ${BUNDLE_ID}"
-              echo "duration: ${MANUAL_MINUTES} minutes"
-            } > "$LOGS/manual-session.txt"
-          else
-            echo "no installed app; holding the desktop for inspection"
-            {
-              echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-              echo "duration: ${MANUAL_MINUTES} minutes"
-            } > "$LOGS/manual-session.txt"
+          # The desktop is the deliverable: open the tools the tester needs and give the
+          # session a moment to come up before the first connection lands.
+          open -a Simulator 2>/dev/null || true
+          open -a Xcode 2>/dev/null || true
+          if [[ -n "${APP_DIR:-}" ]]; then
+            open "$APP_DIR" 2>/dev/null || true
           fi
-          if [[ -n "${UDID:-}" ]]; then
-            open -a Simulator --args -CurrentDeviceUDID "$UDID" 2>/dev/null \
-              || echo "warning: open Simulator from the VNC desktop"
-          else
-            open -a Simulator 2>/dev/null || echo "warning: open Simulator from the VNC desktop"
-          fi
-          if [[ -d app/ios/App/App.xcworkspace ]]; then
-            open app/ios/App/App.xcworkspace 2>/dev/null || true
-          elif [[ -d app/ios/App/App.xcodeproj ]]; then
-            open app/ios/App/App.xcodeproj 2>/dev/null || true
-          fi
-          echo "Manual session open for ${MANUAL_MINUTES} minutes; connect over VNC."
-          # Keep the display awake and the session unlocked for the whole hold: the
-          # runner account password cannot be set on macOS 26 (dscl wants the old one),
-          # so a locked screen would be unrecoverable.
+          {
+            echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "repo: ${APP_DIR:-none}"
+            echo "duration: ${MANUAL_MINUTES} minutes"
+          } > "$LOGS/manual-session.txt"
+          echo "Manual session open for ${MANUAL_MINUTES} minutes; build ${APP_DIR:-the app} in Xcode."
           caffeinate -d -i -m -s -u -t $(( 10#${MANUAL_MINUTES} * 60 + 300 )) &
           sleep $(( 10#${MANUAL_MINUTES} * 60 ))
-          if [[ -n "${UDID:-}" ]]; then
-            xcrun simctl io "$UDID" screenshot "$LOGS/manual-end.png" >/dev/null 2>&1 || true
-          fi
           echo "ended: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$LOGS/manual-session.txt"
 
       # The public run's logs are deleted by cleanup.yml as soon as the job ends, so a

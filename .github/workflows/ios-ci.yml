@@ -409,10 +409,30 @@ jobs:
             exit 1
           fi
 
-          # The console session decides which desktop a client sees: with a different
-          # account, the first connection makes macOS switch the console (fast user
-          # switching) and drops that connection; the next one attaches to the session
-          # that now exists. Publishing that fact saves the tester a guess.
+          # A client that authenticates as an account not owning the console gets its
+          # own session, and on this VM that session renders black. Prefer the console
+          # account whenever the image's own password still works.
+          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
+          PASSWORD_HINT=""
+          if [[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]]; then
+            for cand in runner password admin changeme; do
+              if dscl . -authonly "$CONSOLE_USER" "$cand" </dev/null 2>/dev/null; then
+                VNC_USER="$CONSOLE_USER"
+                PASSWORD_HINT="image default ($cand)"
+                echo "console account ${VNC_USER} accepts the image default password"
+                sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null || true
+                sudo "$KICKSTART" -activate -configure -access -on \
+                  -users "$VNC_USER" -privs -all -restart -agent -console </dev/null || true
+                break
+              fi
+            done
+          fi
+          # Prove what the desk actually shows: the console framebuffer, captured as the
+          # logged-in user, is published with the address so a black client is not the
+          # only evidence available.
+          sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop-console.png" 2>&1 || true
+          sudo screencapture -x "$LOGS/desktop-root.png" 2>&1 || true
+          ls -l "$LOGS"/desktop-*.png 2>&1 || true
           echo "note: if the first connection drops, reconnect - macOS switched the console to ${VNC_USER}"
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
@@ -472,6 +492,7 @@ jobs:
             echo "vnc_address: ${VNC_ADDRESS}"
             echo "vnc_dns: ${TS_DNS}:5900"
             echo "vnc_user: ${VNC_USER}"
+            echo "vnc_password_hint: ${PASSWORD_HINT:-VNC_USER_PASSWORD}"
             echo "session_minutes: ${MANUAL_MINUTES}"
             echo "vnc_auth: apple"
             echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
@@ -489,10 +510,12 @@ jobs:
           mkdir -p "$TMP/ci-logs"
           cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
           cp "$LOGS/vnc-step.log" "$TMP/ci-logs/vnc-step.log"
+          cp "$LOGS"/desktop-*.png "$TMP/ci-logs/" 2>/dev/null || true
           git -C "$TMP" init -q
           git -C "$TMP" config user.name ios-ci
           git -C "$TMP" config user.email ios-ci@users.noreply.github.com
           git -C "$TMP" add ci-logs/manual-ready.txt ci-logs/vnc-step.log
+          git -C "$TMP" add ci-logs/desktop-*.png 2>/dev/null || true
           git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
           if ! git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs \
                2>&1 | tee -a "$LOGS/vnc-publish.log"; then

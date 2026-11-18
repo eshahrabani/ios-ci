@@ -319,16 +319,16 @@ jobs:
           # password via Apple auth (type 30), so create a dedicated admin account and
           # prove it accepts the secret before publishing an address.
           VNC_USER=tester
-          # Every one of these can decide to prompt and block forever; a prompt would
-          # eat the whole step budget, so stdin is closed and each call is bounded.
+          # These can decide to prompt and block forever; stdin is closed so a prompt
+          # fails fast. Do not use `timeout`: macOS ships no such command (exit 127).
           if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
-            if ! timeout 180 sudo sysadminctl -addUser "$VNC_USER" \
+            if ! sudo sysadminctl -addUser "$VNC_USER" \
                 -fullName "iOS CI tester" -password "$VNC_USER_PASSWORD" -admin </dev/null; then
               echo "could not create the ${VNC_USER} account"
               exit 1
             fi
           fi
-          if ! timeout 30 dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
+          if ! dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
             echo "the ${VNC_USER} account does not accept VNC_USER_PASSWORD"
             exit 1
           fi
@@ -338,8 +338,8 @@ jobs:
           # accounts at the ARD authorization step even though the password is right.
           # kickstart needs -allowAccessFor -specifiedUsers before -users, or it
           # rejects the invocation and the step dies under `set -e`.
-          timeout 60 sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null
-          timeout 120 sudo "$KICKSTART" -activate -configure -access -on \
+          sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null
+          sudo "$KICKSTART" -activate -configure -access -on \
             -users "$VNC_USER" -privs -all \
             -restart -agent -console </dev/null
           sudo launchctl enable system/com.apple.screensharing

@@ -80,7 +80,7 @@ jobs:
     # A manual run holds a VNC desktop on the Intel image; normal runs stay on ARM
     # with the 45-minute cap. GitHub caps hosted jobs at 360 minutes, and the CLI
     # caps --manual at 300, so 60 + manual_minutes never exceeds that ceiling.
-    runs-on: ${{ inputs.manual_minutes != '0' && 'macos-26-intel' || 'macos-26' }}
+    runs-on: macos-26
     timeout-minutes: ${{ fromJSON(needs.plan.outputs.job_timeout) }}
     env:
       DEBUG_PUBLIC_LOGS: ${{ inputs.debug_public_logs }}
@@ -360,6 +360,7 @@ jobs:
           APP_REPO: ${{ secrets.APP_REPO }}
           APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
           VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
           MANUAL_MINUTES: ${{ inputs.manual_minutes }}
         run: |
           set -euo pipefail
@@ -378,6 +379,20 @@ jobs:
           caffeinate -u -t 2 || true
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          # Apple auth is the only path that streams on the Intel image; keep an account
+          # whose password is known so the client can use it, and grant it ARD.
+          if [[ -n "${VNC_USER_PASSWORD:-}" ]]; then
+            VNC_USER=tester
+            if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
+              sudo sysadminctl -addUser "$VNC_USER" -fullName "iOS CI tester" \
+                -password "$VNC_USER_PASSWORD" -admin </dev/null 2>&1 || true
+            fi
+            if dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
+              sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null || true
+              sudo "$KICKSTART" -activate -configure -access -on \
+                -users "$VNC_USER" -privs -all -restart -agent -console </dev/null || true
+            fi
+          fi
           # Legacy VNC auth needs no account: the server checks an 8-character password
           # and attaches the client to the console session, whose desktop is the one
           # captured below. Apple auth instead creates a session for the authenticated
@@ -444,7 +459,8 @@ jobs:
             echo "vnc_address: ${VNC_ADDRESS}"
             echo "vnc_dns: ${TS_DNS}:5900"
             echo "session_minutes: ${MANUAL_MINUTES}"
-            echo "vnc_auth: vnc"
+            echo "vnc_auth: vnc,apple"
+            echo "vnc_user: ${VNC_USER:-none}"
             echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           } > "$LOGS/manual-ready.txt"
 

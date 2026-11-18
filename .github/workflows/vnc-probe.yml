@@ -1,0 +1,68 @@
+name: vnc-probe
+run-name: vnc-probe ${{ inputs.image }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Runner label to probe
+        required: true
+        default: macos-26-intel
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe
+    runs-on: ${{ inputs.image }}
+    timeout-minutes: 25
+    steps:
+      - name: Image facts
+        run: |
+          set -uo pipefail
+          echo "== sw_vers: $(sw_vers -productVersion) build=$(sw_vers -buildVersion) arch=$(uname -m)"
+          echo "== who:"; who || true
+          echo "== console user: $(stat -f%Su /dev/console 2>&1 || true)"
+          echo "== GUI domains: $(launchctl list 2>/dev/null | head -1 || true)"
+          echo "== users: $(dscl . -list /Users | grep -v '^_' | tr '\n' ' ')"
+          echo "== display:"; system_profiler SPDisplaysDataType 2>&1 | head -12
+          echo "== processes: $(ps ax -o comm= | grep -iE 'screenshar|ARDAgent|loginwindow|WindowServer|Dock' | sort -u | tr '\n' ' ')"
+          echo "== kickstart: $(ls -l /System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart 2>&1)"
+          echo "== screensharing plist: $(ls -l /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>&1)"
+          echo "== launchctl print:"; sudo launchctl print system/com.apple.screensharing 2>&1 | head -15
+
+      - name: Enable screen sharing
+        run: |
+          set -uo pipefail
+          K=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          echo '--- kickstart activate/configure'
+          sudo "$K" -activate -configure -access -on -allowAccessFor -allUsers -privs -all \
+            -clientopts -setvnclegacy -vnclegacy yes -restart -agent -console 2>&1 | tail -25
+          echo '--- legacy launchctl load'
+          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>&1 | tail -5
+          echo '--- modern enable + kickstart'
+          sudo launchctl enable system/com.apple.screensharing 2>&1 | tail -5
+          sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 | tail -5
+          sudo "$K" -restart -agent -console 2>&1 | tail -10
+          sleep 8
+          echo '--- tcp listeners'; sudo lsof -iTCP -sTCP:LISTEN 2>&1 | head -20
+          echo '--- port 5900'; sudo lsof -iTCP:5900 -sTCP:LISTEN 2>&1 || echo 'NONE on 5900'
+          echo '--- launchctl print system/com.apple.screensharing'; sudo launchctl print system/com.apple.screensharing 2>&1 | head -25
+          echo '--- processes now:'; ps ax -o comm= | grep -iE 'screenshar|ARDAgent' | sort -u || true
+          echo '--- log show (10m):'; sudo log show --last 10m --predicate 'process == "screensharingd" OR eventMessage CONTAINS[c] "screensharing"' 2>&1 | tail -30
+
+      - name: Tailscale install on the image
+        run: |
+          set -uo pipefail
+          echo "== brew prefix: $(brew --prefix 2>&1)"
+          echo '--- brew install tailscale'
+          time brew install tailscale 2>&1 | tail -15
+          echo '--- binaries:'; ls -l "$(brew --prefix)"/bin/tailscale* "$(brew --prefix)"/sbin/tailscaled* 2>&1
+          echo '--- version:'; "$(brew --prefix)/bin/tailscale" version 2>&1 | head -3
+          echo '--- go:'; go version 2>&1
+          echo '--- tailscaled install-system-daemon'
+          sudo -E "$(brew --prefix)/sbin/tailscaled" install-system-daemon 2>&1 | tail -10
+          echo '--- daemon status:'; sudo launchctl print system/com.tailscale.tailscaled 2>&1 | head -12
+          echo '--- tailscale status (no key):'; "$(brew --prefix)/bin/tailscale" status 2>&1 | head -5

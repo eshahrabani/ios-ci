@@ -276,6 +276,10 @@ cmd_run() {
       warn "could not list secrets on $RUNNER_REPO; ensure TAILSCALE_AUTH_KEY, VNC_PASSWORD and VNC_USER_PASSWORD are set"
     fi
   fi
+  local baseline_id
+  baseline_id=$(gh run list --repo "$RUNNER_REPO" --workflow "$WORKFLOW" --limit 1 \
+    --json databaseId 2>/dev/null | jq -r '.[0].databaseId // 0' 2>/dev/null || echo 0)
+  [[ "$baseline_id" =~ ^[0-9]+$ ]] || baseline_id=0
   gh workflow run "$WORKFLOW" --repo "$RUNNER_REPO" --ref main \
     -f "sha=$sha" -f "ref=$export_ref" \
     -f "correlation_id=$correlation" -f "smoke_text=$SMOKE_TEXT" \
@@ -285,13 +289,23 @@ cmd_run() {
 
   # Exact title match: correlations are unique per dispatch, but a substring match
   # would also hit a longer id that happens to start with this one.
-  local title run_id="" waited=0 manual_ready=false
+  local title run_id="" waited=0 manual_ready=false runs stuck
   title="ios-ci $correlation"
   while [[ "$waited" -lt 300 ]]; do
-    run_id=$(gh run list --repo "$RUNNER_REPO" --workflow "$WORKFLOW" --limit 100 \
-      --json databaseId,displayTitle \
-      | jq -r --arg t "$title" 'map(select(.displayTitle == $t)) | first | .databaseId // empty')
+    runs=$(gh run list --repo "$RUNNER_REPO" --workflow "$WORKFLOW" --limit 100 \
+      --json databaseId,displayTitle,conclusion 2>/dev/null || true)
+    run_id=$(printf '%s' "$runs" | jq -r --arg t "$title" \
+      'map(select(.displayTitle == $t)) | first | .databaseId // empty' 2>/dev/null || true)
     [[ -n "$run_id" ]] && break
+    # A workflow-file error (bad expression, an action the repo's policy forbids)
+    # creates a run that never gets its run-name and has no jobs, so the title match
+    # above can never hit. Report it now instead of waiting out the five minutes.
+    stuck=$(printf '%s' "$runs" | jq -r --argjson b "${baseline_id:-0}" \
+      'map(select(.databaseId > $b and .conclusion == "startup_failure")) | first | .databaseId // empty' 2>/dev/null || true)
+    if [[ -n "$stuck" ]]; then
+      die "the run never started: GitHub rejected the workflow file.
+     https://github.com/$RUNNER_REPO/actions/runs/$stuck"
+    fi
     sleep 5; waited=$((waited + 5))
   done
   [[ -n "$run_id" ]] || die "dispatched run '$title' did not appear within 5 minutes"

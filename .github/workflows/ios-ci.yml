@@ -415,9 +415,13 @@ jobs:
           # Capture from this shell: it already holds the screen-recording grant, so the
           # frame stream never triggers the modal consent prompt that freezes input.
           rm -f /tmp/desktop-frame.png
+          # Root captures outside the per-user consent path. Capturing as the console
+          # user makes macOS ask for persistent screen access with a modal dialog that
+          # ignores synthetic clicks, which freezes every later click and key.
           (
             while true; do
-              screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null
+              sudo screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null
+              sudo chmod 644 /tmp/desktop-frame.png 2>/dev/null
               sleep 1
             done
           ) &

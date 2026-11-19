@@ -560,8 +560,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send("nothing to change", status=400)
             item = {"t": "config"}
             item.update(change)
-            applied = deliver(item)
-            return self.send("config " + ("applied" if applied else "unavailable"))
+            # Queued like every other command: one thread owns the agent socket.
+            enqueue(item)
+            available = INPUT_SOCKET[0] is not None
+            return self.send("config " + ("queued" if available else "queued (agent not connected)"))
         if url.path in ("/click", "/rclick", "/down", "/move", "/up", "/scroll"):
             width, height = display_size()
 

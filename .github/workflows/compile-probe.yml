@@ -5,7 +5,7 @@ permissions: {contents: read}
 jobs:
   p:
     runs-on: macos-26
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Compile the streamer from the pushed commit
         run: |

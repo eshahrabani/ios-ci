@@ -21,7 +21,7 @@ import urllib.parse
 PORT = int(sys.argv[1])
 TOKEN = sys.argv[2]
 BIND = sys.argv[3] if len(sys.argv) > 3 else "0.0.0.0"
-FRAME = "/tmp/desktop-frame.png"
+FRAME = "/tmp/desktop-frame.jpg"
 LOCK = threading.Lock()
 CACHE = [0.0, b""]
 KEYCODES = {
@@ -69,9 +69,24 @@ def frame():
 
 
 def dimensions(data):
-    if data[:8] != b"\x89PNG\r\n\x1a\n" or len(data) < 24:
-        return 1024, 768
-    return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if data[:2] == b"\xff\xd8":            # JPEG: walk to the first SOF frame header
+        i, n = 2, len(data)
+        while i + 9 < n:
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                return (int.from_bytes(data[i + 7:i + 9], "big"),
+                        int.from_bytes(data[i + 5:i + 7], "big"))
+            if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+                i += 2
+                continue
+            i += 2 + int.from_bytes(data[i + 2:i + 4], "big")
+    return 1024, 768
 
 
 PAGE = """<!doctype html><meta charset="utf-8">
@@ -109,7 +124,7 @@ function draw() {
 }
 async function poll() {
   try {
-    const r = await fetch('/frame.png?t=' + token + '&since=' + since);
+    const r = await fetch('/frame.jpg?t=' + token + '&since=' + since);
     if (r.status === 200) {
       since = Number(r.headers.get('X-Frame-Time') || 0);
       const bmp = await createImageBitmap(await r.blob());
@@ -117,7 +132,7 @@ async function poll() {
       last = bmp; draw(); frames++; lastFrame = Date.now();
     } else if (r.status === 503) { log('capture unavailable'); }
   } catch (e) { log('frame error: ' + e.message); }
-  setTimeout(poll, 110);
+  setTimeout(poll, 60);
 }
 setInterval(() => {
   fps = frames; frames = 0;
@@ -220,13 +235,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send("forbidden", status=403)
         if url.path == "/":
             return self.send(PAGE.encode(), kind="text/html; charset=utf-8")
-        if url.path == "/frame.png":
+        if url.path in ("/frame.jpg", "/frame.png"):
             stamp, data = frame()
             if not data:
                 return self.send("capture unavailable", status=503)
             if query.get("since", ["0"])[0] == f"{stamp:.3f}":
                 return self.send(b"", status=204)
-            return self.send(data, kind="image/png",
+            return self.send(data, kind="image/jpeg",
                              extra={"X-Frame-Time": f"{stamp:.3f}"})
         if url.path in ("/click", "/rclick", "/down", "/move", "/up", "/scroll"):
             width, height = dimensions(frame()[1])

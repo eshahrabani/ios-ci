@@ -631,7 +631,8 @@ jobs:
           caffeinate -u -t 1 || true
           # Capture for the whole hold: only this job's own shell carries the image's
           # screen-capture grant, and a job started from a step dies with that step.
-          rm -f /tmp/desktop-frame.png
+          FRAME=/tmp/desktop-frame.jpg
+          rm -f /tmp/desktop-frame.png "$FRAME" "$FRAME.tmp"
           # The assertion has to live in the console session: started from this step it
           # does not stop the display from blanking, and `screencapture` then blocks on
           # the sleeping display (frames minutes apart).
@@ -639,12 +640,15 @@ jobs:
           CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
           sudo launchctl asuser "$CONSOLE_UID" /usr/bin/caffeinate -d -i -m -s -u \
             -t $(( 10#${MANUAL_MINUTES} * 60 + 600 )) 2>/dev/null &
+          # JPEG, written to a temp name and renamed: the server never reads a
+          # half-written frame, and a capture costs ~0.2 s, so this runs at several fps
+          # instead of the one frame per second a fixed sleep allowed.
           (
             set +e                     # one failed capture must not end the stream
             while true; do
-              screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null || true
-              chmod 644 /tmp/desktop-frame.png 2>/dev/null || true
-              sleep 1
+              screencapture -x -t jpg "$FRAME.tmp" 2>/dev/null \
+                && mv -f "$FRAME.tmp" "$FRAME" 2>/dev/null
+              sleep 0.03
             done
           ) &
           # The desktop is the deliverable: open the tools the tester needs and give the
@@ -691,7 +695,7 @@ jobs:
             tail -20 "$LOGS/desktop-server.log" 2>&1
             echo
             echo "== frame"
-            ls -l /tmp/desktop-frame.png 2>&1
+            ls -l /tmp/desktop-frame.jpg /tmp/desktop-frame.jpg.tmp 2>&1
           } > "$LOGS/manual-diagnostics.txt" 2>&1
           true
 

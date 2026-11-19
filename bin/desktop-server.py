@@ -667,9 +667,8 @@ addEventListener('resize', fit);
 fit();
 function imageXY(e) {
   const r = canvas.getBoundingClientRect();
-  if (!r.width || !r.height || !canvas.width || !canvas.height) return null;
-  return [(e.clientX - r.left) * canvas.width / r.width,
-          (e.clientY - r.top) * canvas.height / r.height];
+  if (!r.width || !r.height) return null;
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
 }
 
 let down = false, start = [0, 0], dragging = false;

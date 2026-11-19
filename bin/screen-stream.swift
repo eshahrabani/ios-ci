@@ -30,9 +30,9 @@ func err(_ line: String) {
 
 let arguments = CommandLine.arguments
 let outPath = arguments.count > 1 ? arguments[1] : "/tmp/desktop-frame.jpg"
-let maxFPS = arguments.count > 2 ? (Double(arguments[2]) ?? 60) : 60
-let quality = arguments.count > 3 ? (Double(arguments[3]) ?? 0.55) : 0.55
-let maxWidth = arguments.count > 4 ? (Int(arguments[4]) ?? 1280) : 1280
+var maxFPS = arguments.count > 2 ? (Double(arguments[2]) ?? 60) : 60
+var quality = arguments.count > 3 ? (Double(arguments[3]) ?? 0.55) : 0.55
+var maxWidth = arguments.count > 4 ? (Int(arguments[4]) ?? 1280) : 1280
 let inputPort = UInt16(ProcessInfo.processInfo.environment["INPUT_PORT"] ?? "7777") ?? 7777
 let beatPath = outPath + ".beat"
 let statPath = outPath + ".stat"
@@ -243,6 +243,11 @@ final class InputAgent {
             mouse(message)
         case "scroll":
             scroll(message)
+        case "config":
+            if let width = message["width"] as? Int, width > 0 { maxWidth = width }
+            if let fps = message["fps"] as? Double, fps >= 1 { maxFPS = min(120, fps) }
+            if let value = message["quality"] as? Double { quality = max(0.2, min(0.95, value)) }
+            DispatchQueue.main.async { startStream() }
         default:
             break
         }

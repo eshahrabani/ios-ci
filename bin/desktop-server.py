@@ -547,6 +547,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(b"", status=204)
             return self.send(data, kind="image/jpeg",
                              extra={"X-Frame-Time": f"{stamp:.3f}"})
+        if url.path == "/config":
+            change = {}
+            for key, cast in (("width", int), ("fps", float), ("quality", float)):
+                value = query.get(key, [""])[0]
+                if value:
+                    try:
+                        change[key] = cast(value)
+                    except ValueError:
+                        return self.send("bad value", status=400)
+            if not change:
+                return self.send("nothing to change", status=400)
+            item = {"t": "config"}
+            item.update(change)
+            applied = deliver(item)
+            return self.send("config " + ("applied" if applied else "unavailable"))
         if url.path in ("/click", "/rclick", "/down", "/move", "/up", "/scroll"):
             width, height = display_size()
 

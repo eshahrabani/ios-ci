@@ -89,6 +89,7 @@ const token = new URLSearchParams(location.search).get('t');
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const hud = document.getElementById('hud');
 let size = [0, 0], box = [0, 0, 1, 1], since = 0, frames = 0, fps = 0, last = null;
+let lastFrame = 0;
 
 const log = m => { hud.textContent = m; };
 
@@ -113,14 +114,18 @@ async function poll() {
       since = Number(r.headers.get('X-Frame-Time') || 0);
       const bmp = await createImageBitmap(await r.blob());
       if (bmp.width !== size[0] || bmp.height !== size[1]) { size = [bmp.width, bmp.height]; fit(); }
-      last = bmp; draw(); frames++;
+      last = bmp; draw(); frames++; lastFrame = Date.now();
     } else if (r.status === 503) { log('capture unavailable'); }
   } catch (e) { log('frame error: ' + e.message); }
   setTimeout(poll, 110);
 }
 setInterval(() => {
   fps = frames; frames = 0;
-  if (size[0]) log('desktop ' + size[0] + 'x' + size[1] + '  ' + fps + ' fps' + hint);
+  if (size[0]) {
+    const stalled = lastFrame && Date.now() - lastFrame > 6000;
+    log('desktop ' + size[0] + 'x' + size[1] + '  ' + fps + ' fps' +
+        (stalled ? '  STALLED (capture stopped)' : '') + hint);
+  }
 }, 1000);
 let hint = '';
 addEventListener('resize', fit);

@@ -412,6 +412,20 @@ jobs:
             exit 1
           fi
           HOST="${TS_IP:-$TS_DNS}"
+          # Capture from this shell: it already holds the screen-recording grant, so the
+          # frame stream never triggers the modal consent prompt that freezes input.
+          rm -f /tmp/desktop-frame.png
+          (
+            while true; do
+              screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null
+              sleep 1
+            done
+          ) &
+          for _ in $(seq 1 20); do
+            [[ -s /tmp/desktop-frame.png ]] && break
+            sleep 1
+          done
+          echo "capture loop frame bytes: $(stat -f%z /tmp/desktop-frame.png 2>/dev/null || echo 0)"
           sudo launchctl asuser "$CONSOLE_UID" /bin/bash -c \
             "nohup /usr/bin/python3 '$RUNNER_TEMP/desktop-server.py' 6080 '$TOKEN' '$HOST' > '$LOGS/desktop-server.log' 2>&1 &"
           sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
@@ -428,17 +442,7 @@ jobs:
             exit 1
           fi
           echo "desktop server listening"
-          # The server's own interpreter needs the capture grant; if macOS still puts a
-          # modal prompt up, Return approves the default button and the pending capture
-          # completes instead of blocking every later frame and click.
-          curl -s -m 12 "http://${HOST}:6080/frame.png?t=${TOKEN}" -o "$RUNNER_TEMP/prime.png" || true
-          if [[ ! -s "$RUNNER_TEMP/prime.png" ]]; then
-            echo "capture blocked; approving the prompt"
-            sudo launchctl asuser "$CONSOLE_UID" "$CLICLICK" kp:return 2>&1 | head -2 || true
-            sleep 3
-            curl -s -m 15 "http://${HOST}:6080/frame.png?t=${TOKEN}" -o "$RUNNER_TEMP/prime.png" || true
-          fi
-          echo "prime frame bytes: $(stat -f%z "$RUNNER_TEMP/prime.png" 2>/dev/null || echo 0)"
+          echo "frame bytes: $(stat -f%z /tmp/desktop-frame.png 2>/dev/null || echo 0)"
 
           DESKTOP_URL="http://${HOST}:6080/?t=${TOKEN}"
           {

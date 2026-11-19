@@ -96,16 +96,23 @@ def run(cmd):
 
 
 def frame():
+    """Serve the newest frame written by the capture loop.
+
+    Capturing from here would make this interpreter the process macOS asks for screen
+    recording consent, and that modal prompt blocks every request; the loop runs from
+    the shell that already holds the grant.
+    """
     with LOCK:
-        now = time.time()
-        if now - LAST[0] < 0.5 and LAST[1]:
-            return LAST[1]
-        run(["screencapture", "-x", "-t", "png", FRAME])
         try:
-            LAST[1] = open(FRAME, "rb").read()
+            stamp = os.stat(FRAME).st_mtime
         except OSError:
-            LAST[1] = LAST[1] or b""
-        LAST[0] = now
+            return LAST[1]
+        if stamp != LAST[0] or not LAST[1]:
+            try:
+                LAST[1] = open(FRAME, "rb").read()
+                LAST[0] = stamp
+            except OSError:
+                pass
         return LAST[1]
 
 

@@ -649,8 +649,9 @@ jobs:
           ) &
           # The desktop is the deliverable: open the tools the tester needs and give the
           # session a moment to come up before the first connection lands.
-          open -a Simulator 2>/dev/null || true
-          open -a Xcode 2>/dev/null || true
+          # Only Finder: launching Xcode or the Simulator here saturates the 4-core VM
+          # and makes screencapture block for a minute at a time; the tester opens them
+          # from the desktop when needed.
           if [[ -n "${APP_DIR:-}" ]]; then
             open "$APP_DIR" 2>/dev/null || true
           fi

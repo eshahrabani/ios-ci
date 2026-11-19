@@ -12,7 +12,7 @@
 //
 // A partial frame assumes its predecessor is on screen, so a reader that misses one
 // must skip partials and ask for a full frame (`{"t":"full"}` on the input socket);
-// one full frame is written every 60 frames regardless. A heartbeat <out>.beat and a
+// one full frame is written every 30 frames regardless. A heartbeat <out>.beat and a
 // stat file <out>.stat tell the server whether capture is alive and how fast it is.
 //
 // Input is injected in-process over 127.0.0.1:<INPUT_PORT> (default 7777), one JSON
@@ -195,7 +195,7 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         forceFull = false
         // A large change is cheaper as one full frame than as a crop plus headers.
         let area = box.map { $0.w * $0.h } ?? (width * height)
-        let keyframe = sinceFull >= 60          // about two seconds at 30 fps
+        let keyframe = sinceFull >= 30          // about a second at 30 fps
         let full = keyframe || box == nil || area * 100 >= width * height * 60
         let started = DispatchTime.now().uptimeNanoseconds
         guard let jpeg = jpegData(buffer, quality: quality,

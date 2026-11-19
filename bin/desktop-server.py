@@ -552,13 +552,14 @@ let lastSeq = 0, fullAskedAt = 0;
 // next crop would leave the missed change on screen forever, which looks like streaks
 // and torn regions. So a gap freezes the canvas and asks the streamer for a full
 // frame; one is also written every 30 frames, so the ask is a shortcut, not a need.
-function needFull() {
+function needFull(urgent) {
   const unresolved = !haveFull;
   haveFull = false;
   const now = performance.now();
-  // Ask once per gap: the transition always asks, repeated calls back off to one a
-  // second so a long decode does not flood the agent.
-  if (unresolved && now - fullAskedAt < 1000) return;
+  // Ask whenever a good frame turns into a gap. While the gap stays unresolved, back
+  // off - unless a frame was dropped mid-decode, which may have been the full frame
+  // being delivered, and on an idle screen nothing else would replace it.
+  if (unresolved && now - fullAskedAt < (urgent ? 200 : 1000)) return;
   fullAskedAt = now;
   send({t: 'full'});
 }
@@ -595,7 +596,7 @@ function connect() {
   ws.binaryType = 'blob';
   ws.onmessage = async event => {
     if (typeof event.data === 'string') return;
-    if (decoding) { needFull(); return; }   // this frame is lost; the canvas is now stale
+    if (decoding) { needFull(true); return; }   // lost mid-decode: maybe the full
     decoding = true;
     try {
       const bytes = new Uint8Array(await event.data.arrayBuffer());

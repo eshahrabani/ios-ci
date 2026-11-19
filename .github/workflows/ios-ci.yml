@@ -425,15 +425,11 @@ jobs:
           # screen-capture grant, and that is what raises the modal prompt
           # ("bash is requesting to bypass the system private window picker") that
           # then swallows every click. Measured: the same shell captures silently.
-          # A background job of this step is killed when the step ends, which freezes
-          # the stream at the first frame; a launchd job outlives it and stays in the
-          # same responsibility chain (hence no consent prompt).
+          # Frames are captured by the hold step, which lives for the whole session:
+          # only this job's own shell carries the image's screen-capture grant. A
+          # background job here or under launchd/asuser is a different TCC chain and
+          # raises a modal consent dialog that blocks every click.
           rm -f /tmp/desktop-frame.png
-          sudo launchctl remove ios-ci-capture 2>/dev/null || true
-          sudo launchctl submit -l ios-ci-capture -o "$LOGS/capture.log" -e "$LOGS/capture.log" \
-            -- /bin/bash -c 'while true; do screencapture -x -t png /tmp/desktop-frame.png; chmod 644 /tmp/desktop-frame.png; sleep 1; done'
-          sleep 3
-          echo "capture job: $(sudo launchctl list | grep -c ios-ci-capture)"
           for _ in $(seq 1 20); do
             [[ -s /tmp/desktop-frame.png ]] && break
             sleep 1

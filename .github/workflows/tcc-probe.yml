@@ -1,0 +1,53 @@
+name: tcc-probe
+run-name: tcc-probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - name: Inspect and extend the screen-capture grant
+        run: |
+          set -uo pipefail
+          SYS="/Library/Application Support/com.apple.TCC/TCC.db"
+          USR="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          echo "== system db"
+          sudo sqlite3 "$SYS" "select client, client_type, auth_value, length(csreq), flags from access where service='kTCCServiceScreenCapture'" 2>&1 | head -20
+          echo "== user db"
+          sudo sqlite3 "$USR" "select client, client_type, auth_value, length(csreq), flags from access where service='kTCCServiceScreenCapture'" 2>&1 | head -20
+          echo "== tables"
+          sudo sqlite3 "$SYS" ".tables" 2>&1 | head -5
+
+          echo "== capture as shipped"
+          screencapture -x /tmp/before.png 2>&1 | head -3
+          ls -l /tmp/before.png 2>&1
+
+          echo "== prompts visible?"
+          osascript -e 'tell application "System Events" to get name of every window of every process whose visible is true' 2>&1 | tr ',' '\n' | grep -vi 'finder\|dock\|systemui\|controlcenter' | head -20
+
+          echo "== insert with the runner binary requirement"
+          CSREQ=$(sudo sqlite3 "$SYS" "select hex(csreq) from access where service='kTCCServiceScreenCapture' and csreq is not null limit 1" 2>/dev/null)
+          echo "csreq sample bytes: ${#CSREQ}"
+          if [[ -n "$CSREQ" ]]; then
+            for db in "$SYS" "$USR"; do
+              sudo sqlite3 "$db" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, csreq, flags) values ('kTCCServiceScreenCapture','/bin/bash',1,2,0,1,x'$CSREQ',0)" 2>&1 | head -2
+            done
+            sudo killall tccd 2>/dev/null || true
+            sleep 2
+            echo "== capture after grant"
+            screencapture -x /tmp/after.png 2>&1 | head -3
+            ls -l /tmp/after.png 2>&1
+            echo "== still prompted?"
+            osascript -e 'tell application "System Events" to get name of every window of every process whose visible is true' 2>&1 | tr ',' '\n' | grep -vi 'finder\|dock\|systemui\|controlcenter' | head -10
+          else
+            echo "no csreq to copy"
+          fi
+
+          echo "== projects that already pass TCC (for reference)"
+          sudo sqlite3 "$SYS" "select client, service, auth_value from access limit 10" 2>&1 | head -10

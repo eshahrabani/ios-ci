@@ -380,7 +380,24 @@ jobs:
           echo "console user: ${CONSOLE_USER}"
 
           # Evidence that the desk exists, published with the address.
-          sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop.png" 2>&1 || true
+          sudo launchctl asuser "$CONSOLE_UID" screencapture -C -x "$LOGS/desktop.png" 2>&1 \
+            || sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop.png" 2>&1 || true
+
+          # Input needs real CGEvents: System Events' position clicks are no-ops.
+          brew install cliclick 2>&1 | tail -2 || true
+          CLICLICK=$(command -v cliclick || echo /opt/homebrew/bin/cliclick)
+          echo "cliclick: ${CLICLICK}"
+          # Accessibility for the injected events, and for the tools that post them.
+          TCCDB="/Library/Application Support/com.apple.TCC/TCC.db"
+          for client in "/usr/bin/python3" "$CLICLICK" "/bin/bash"; do
+            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceAccessibility','$client',1,2,0,1,0)" 2>&1 | head -1 || true
+          done
+          sudo killall tccd 2>/dev/null || true
+          sleep 1
+          # Prove that events land before announcing a desktop nobody can drive.
+          "$CLICLICK" m:520,520 2>&1 | head -2
+          sudo launchctl asuser "$CONSOLE_UID" "$CLICLICK" m:640,360 2>&1 | head -2 || true
+          echo "pointer: $(sudo launchctl asuser "$CONSOLE_UID" "$CLICLICK" p 2>&1 | head -1)"
 
           curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/desktop-server.py" \
             -o "$RUNNER_TEMP/desktop-server.py"

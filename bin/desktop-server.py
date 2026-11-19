@@ -9,6 +9,7 @@ this serves the former and drives the latter. Run it in the console session:
 """
 import http.server
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -49,10 +50,31 @@ async function frame() {
   setTimeout(frame, 900);
 }
 frame();
-img.addEventListener('click', async e => {
+let down = false, lastMove = 0, last = [0, 0];
+function frac(e) {
   const r = img.getBoundingClientRect();
-  const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
-  hud.textContent = 'click ' + fx.toFixed(3) + ',' + fy.toFixed(3);
+  return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
+}
+img.addEventListener('mousedown', async e => {
+  const [fx, fy] = frac(e); last = [fx, fy]; down = true;
+  hud.textContent = 'down ' + fx.toFixed(3) + ',' + fy.toFixed(3);
+  await fetch('/down?fx=' + fx + '&fy=' + fy + '&t=' + token);
+});
+img.addEventListener('mousemove', async e => {
+  if (!down) return;
+  const now = Date.now(); if (now - lastMove < 150) return; lastMove = now;
+  const [fx, fy] = frac(e); last = [fx, fy];
+  await fetch('/move?fx=' + fx + '&fy=' + fy + '&t=' + token);
+});
+window.addEventListener('mouseup', async e => {
+  if (!down) return; down = false;
+  const [fx, fy] = frac(e); last = [fx, fy];
+  hud.textContent = 'up ' + fx.toFixed(3) + ',' + fy.toFixed(3);
+  await fetch('/up?fx=' + fx + '&fy=' + fy + '&t=' + token);
+});
+img.addEventListener('dblclick', async e => {
+  const [fx, fy] = frac(e);
+  await fetch('/click?fx=' + fx + '&fy=' + fy + '&t=' + token);
   await fetch('/click?fx=' + fx + '&fy=' + fy + '&t=' + token);
 });
 let typed = '';
@@ -98,6 +120,16 @@ def osa(script):
     return run(["osascript", "-e", script])
 
 
+def cliclick_path():
+    for candidate in ("/opt/homebrew/bin/cliclick", "/usr/local/bin/cliclick"):
+        if os.path.exists(candidate):
+            return candidate
+    return shutil.which("cliclick") or ""
+
+
+CLICLICK = cliclick_path()
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -125,13 +157,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not data:
                 return self.send(b"capture failed", status=503)
             return self.send(data, kind="image/png")
-        if url.path == "/click":
+        if url.path in ("/click", "/down", "/move", "/up", "/drag"):
             width, height = screen_size()
-            fx = float(query.get("fx", ["0.5"])[0])
-            fy = float(query.get("fy", ["0.5"])[0])
-            x, y = int(fx * width), int(fy * height)
-            osa(f'tell application "System Events" to click at {{{x}, {y}}}')
-            return self.send(f"clicked {x},{y}".encode(), kind="text/plain")
+
+            def point(prefix):
+                fx = float(query.get(f"fx{prefix}", ["0.5"])[0])
+                fy = float(query.get(f"fy{prefix}", ["0.5"])[0])
+                return int(fx * width), int(fy * height)
+
+            x, y = point("")
+            if not CLICLICK:
+                return self.send(b"cliclick is not installed", status=503)
+            if url.path == "/click":
+                run([CLICLICK, f"c:{x},{y}"])
+            elif url.path == "/down":
+                run([CLICLICK, f"dd:{x},{y}"])
+            elif url.path == "/move":
+                run([CLICLICK, f"m:{x},{y}"])
+            elif url.path == "/up":
+                run([CLICLICK, f"du:{x},{y}"])
+            else:
+                x2, y2 = point("2")
+                run([CLICLICK, f"dd:{x},{y}", f"dm:{x2},{y2}", f"du:{x2},{y2}"])
+            return self.send(f"{url.path} {x},{y}".encode(), kind="text/plain")
         if url.path == "/type":
             text = query.get("text", [""])[0]
             if text:

@@ -491,6 +491,11 @@ jobs:
             dscl . -authonly runner "" </dev/null 2>&1 || echo "empty rejected"
             echo "== remote management prefs"
             sudo defaults read /Library/Preferences/com.apple.RemoteManagement 2>&1 | head -6
+            echo "== input probe (can anything inject events?)"
+            sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
+              -e 'tell application "System Events" to keystroke "a"' 2>&1 | head -3
+            sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
+              -e 'tell application "System Events" to get name of first process' 2>&1 | head -3
             echo "== tcc rows"
             sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
               "select client, auth_value from access where service='kTCCServiceScreenCapture'" 2>&1 | head -6

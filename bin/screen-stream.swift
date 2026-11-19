@@ -165,8 +165,8 @@ func startStream() {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { startStream() }
             }
             sink.onSlow = {
-                guard maxWidth > 640 else { return }
-                maxWidth = max(640, maxWidth * 3 / 4)
+                guard maxWidth > 768 else { return }
+                maxWidth = max(768, maxWidth * 3 / 4)
                 lastAdjust = Date().timeIntervalSince1970
                 err("capture is slow; dropping to max width \(maxWidth)")
                 DispatchQueue.main.async { startStream() }

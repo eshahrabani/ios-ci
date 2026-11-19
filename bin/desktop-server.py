@@ -544,6 +544,27 @@ function log(message) { hud.textContent = message; }
 // TCP keeps the order, so a keystroke costs one one-way trip instead of a full
 // request/response round trip per character.
 let ws = null, decoding = false, haveFull = false, shownAt = [];
+let streamWidth = 0, tuningAt = 0;
+// A slow client (a software compositor, a weak link) paints far below the capture
+// rate, and every frame costs pixels twice over: once to decode and once to fill the
+// canvas. Step the capture size down until the paint rate fits, and back up when it
+// does. The server queues {"t":"config"} to the streamer, which restarts capture at
+// the new size and sends one full frame.
+function tune() {
+  const now = performance.now();
+  if (now - tuningAt < 6000 || !streamWidth) return;
+  const recent = shownAt.filter(t => now - t <= 2000);
+  if (recent.length < 6) return;         // an idle screen proves nothing
+  const shown = recent.length / 2;
+  let next = streamWidth;
+  if (shown < 12) next = Math.max(560, Math.round(streamWidth * 0.8 / 40) * 40);
+  else if (shown > 26) next = Math.min(960, Math.round(streamWidth * 1.15 / 40) * 40);
+  if (next === streamWidth) return;
+  tuningAt = now;
+  streamWidth = next;
+  fetch('/config?width=' + next + '&t=' + encodeURIComponent(token));
+}
+setInterval(tune, 3000);
 function connect() {
   if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -564,6 +585,7 @@ function connect() {
       if (w <= 0 || h <= 0) return;
       if (full) {
         haveFull = true;
+        streamWidth = w;
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;

@@ -14,10 +14,12 @@ The page holds one multipart/x-mixed-replace connection and the browser renders 
 as they arrive: no polling latency, and a slow client simply sees fewer frames because
 the writer blocks (the next write always sends the newest frame).
 """
+import collections
 import http.server
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -29,6 +31,11 @@ TOKEN = sys.argv[2]
 BIND = sys.argv[3] if len(sys.argv) > 3 else "0.0.0.0"
 FRAME = "/tmp/desktop-frame.jpg"
 BEAT = FRAME + ".beat"                  # touched every second by the capture process
+STAT = FRAME + ".stat"                  # capture counters written by the same process
+INPUT_PORT = int(os.environ.get("INPUT_PORT", "7777"))
+INPUT_SOCKET = [None]                   # connection to the capture process's input agent
+INPUT_QUEUE = collections.deque()       # one ordered queue: keystrokes must not reorder
+INPUT_COND = threading.Condition()
 
 LOCK = threading.Lock()
 COND = threading.Condition(LOCK)
@@ -44,6 +51,16 @@ KEYCODES = {
 }
 APPLE_MODIFIERS = {"cmd": "command down", "ctrl": "control down",
                    "alt": "option down", "shift": "shift down"}
+# Virtual keycodes for chord targets: the physical key, so Cmd+Shift+4 is the
+# screenshot shortcut and not Cmd+$.
+CHAR_CODES = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+    "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+    "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25, "7": 26,
+    "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35,
+    "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45,
+    "m": 46, ".": 47, "`": 50,
+}
 
 
 def cliclick_path():
@@ -65,6 +82,110 @@ def run(cmd):
 
 def osa(script):
     return run(["osascript", "-e", script])
+
+
+def streamer_stat():
+    try:
+        with open(STAT, "rb") as handle:
+            return json.loads(handle.read() or b"{}")
+    except (OSError, ValueError):
+        return {}
+
+
+def display_size():
+    stat = streamer_stat()
+    if stat.get("dw") and stat.get("dh"):
+        return int(stat["dw"]), int(stat["dh"])
+    return dimensions(frame()[1])
+
+
+def input_socket():
+    connection = INPUT_SOCKET[0]
+    if connection is not None:
+        return connection
+    try:
+        connection = socket.create_connection(("127.0.0.1", INPUT_PORT), timeout=1.0)
+        connection.settimeout(2.0)
+        INPUT_SOCKET[0] = connection
+        return connection
+    except OSError:
+        return None
+
+
+def deliver(item):
+    """Send one command to the capture process; False when its agent is absent."""
+    connection = input_socket()
+    if connection is None:
+        return False
+    try:
+        connection.sendall(json.dumps(item).encode() + b"\n")
+        return True
+    except OSError:
+        INPUT_SOCKET[0] = None
+        try:
+            connection.close()
+        except OSError:
+            pass
+        return False
+
+
+def fallback(item):
+    """Slow path (cliclick/osascript) for when the capture process is not running."""
+    kind = item.get("t")
+    if kind == "char":
+        text = item.get("s", "")
+        escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+        osa(f'tell application "System Events" to keystroke "{escaped}"')
+    elif kind == "key":
+        code = item.get("code")
+        mods = item.get("flags") or []
+        using = ""
+        if mods:
+            using = " using {" + ", ".join(APPLE_MODIFIERS[m] for m in mods) + "}"
+        osa(f'tell application "System Events" to key code {code}{using}')
+    elif kind == "scroll":
+        dy = item.get("dy", 0)
+        code = "121" if dy > 0 else "116"
+        for _ in range(min(5, max(1, abs(int(dy)) // 60 or 1))):
+            osa(f'tell application "System Events" to key code {code}')
+    elif kind == "mouse" and CLICLICK:
+        x, y = int(item.get("x", 0)), int(item.get("y", 0))
+        action = item.get("type")
+        button = item.get("button", "left")
+        if action in ("move", "drag"):
+            run([CLICLICK, f"dm:{x},{y}"])
+        elif action == "down" and button == "left":
+            run([CLICLICK, f"dd:{x},{y}"])
+        elif action == "up" and button == "left":
+            run([CLICLICK, f"du:{x},{y}"])
+        elif action == "up" and button == "right":
+            run([CLICLICK, f"rc:{x},{y}"])
+
+
+def enqueue(item):
+    with INPUT_COND:
+        if len(INPUT_QUEUE) > 400:
+            return                      # far behind: dropping beats growing latency
+        INPUT_QUEUE.append(item)
+        INPUT_COND.notify()
+
+
+def input_worker():
+    """One thread, in order: concurrent cliclick calls used to reorder keystrokes."""
+    while True:
+        with INPUT_COND:
+            while not INPUT_QUEUE:
+                INPUT_COND.wait()
+            item = INPUT_QUEUE.popleft()
+            # A run of pointer moves only needs its newest position; skipping the
+            # older ones keeps a drag from lagging behind the pointer.
+            while (item.get("t") == "mouse" and item.get("type") == "drag"
+                   and INPUT_QUEUE
+                   and INPUT_QUEUE[0].get("t") == "mouse"
+                   and INPUT_QUEUE[0].get("type") == "drag"):
+                item = INPUT_QUEUE.popleft()
+        if not deliver(item):
+            fallback(item)
 
 
 def dimensions(data):
@@ -180,8 +301,16 @@ async function send(path, params) {
     hint = '  ' + (await r.text());
   } catch (err) { hint = '  ' + path + ' failed'; }
 }
+// Keys and clicks must arrive in the order they were typed, and parallel fetches can
+// reach the server in any order. Moves and wheel deltas stay parallel: they are
+// coalesced on the server, where only the newest position matters.
+let ordered = Promise.resolve();
+function sendOrdered(path, params) {
+  ordered = ordered.then(() => send(path, params)).catch(() => {});
+  return ordered;
+}
 
-let down = false, start = [0, 0], dragging = false, pending = null, timer = null;
+let down = false, start = [0, 0], dragging = false;
 img.addEventListener('pointerdown', e => {
   if (e.button !== 0) return;          // right button belongs to contextmenu alone
   const point = imageXY(e);
@@ -190,6 +319,22 @@ img.addEventListener('pointerdown', e => {
   start = point; down = true; dragging = false;
   e.preventDefault();
 });
+// One move in flight, always the newest: a drag follows the pointer at the link's
+// round-trip rate instead of queueing stale positions behind it.
+let movePending = null, moveScheduled = false;
+function queueMove(fx, fy) {
+  movePending = [fx, fy];
+  if (moveScheduled) return;
+  moveScheduled = true;
+  const step = () => {
+    if (!movePending) { moveScheduled = false; return; }
+    const p = movePending;
+    movePending = null;
+    ordered = ordered.then(() => send('/move', {fx: p[0], fy: p[1]})).catch(() => {});
+    ordered.then(step);
+  };
+  step();
+}
 img.addEventListener('pointermove', e => {
   if (!down) return;
   const point = imageXY(e);
@@ -197,20 +342,16 @@ img.addEventListener('pointermove', e => {
   const [fx, fy] = point;
   if (!dragging && Math.abs(fx - start[0]) * img.naturalWidth < 3 &&
       Math.abs(fy - start[1]) * img.naturalHeight < 3) return;
-  if (!dragging) { dragging = true; send('/down', {fx: start[0], fy: start[1]}); }
-  pending = [fx, fy];
-  if (!timer) timer = setTimeout(() => {
-    timer = null;
-    if (pending) { const p = pending; pending = null; send('/move', {fx: p[0], fy: p[1]}); }
-  }, 40);
+  if (!dragging) { dragging = true; sendOrdered('/down', {fx: start[0], fy: start[1]}); }
+  queueMove(fx, fy);
 });
 img.addEventListener('pointerup', e => {
   if (e.button !== 0 || !down) return;
   down = false;
   const point = imageXY(e);
   if (!point) return;
-  if (dragging) send('/up', {fx: point[0], fy: point[1]});
-  else send('/click', {fx: point[0], fy: point[1]});
+  if (dragging) sendOrdered('/up', {fx: point[0], fy: point[1]});
+  else sendOrdered('/click', {fx: point[0], fy: point[1], count: e.detail || 1});
   dragging = false;
 });
 img.addEventListener('pointercancel', () => { down = false; dragging = false; });
@@ -218,18 +359,21 @@ img.addEventListener('dragstart', e => e.preventDefault());
 img.addEventListener('contextmenu', e => {
   e.preventDefault();
   const point = imageXY(e);
-  if (point) send('/rclick', {fx: point[0], fy: point[1]});
+  if (point) sendOrdered('/rclick', {fx: point[0], fy: point[1]});
 });
 img.addEventListener('wheel', e => {
   e.preventDefault();
-  send('/scroll', {dy: Math.sign(e.deltaY) * Math.min(10, Math.abs(e.deltaY))});
+  const point = imageXY(e) || [0.5, 0.5];
+  const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
+  const dy = Math.round(Math.max(-240, Math.min(240, e.deltaY * unit)));
+  send('/scroll', {dy, fx: point[0].toFixed(4), fy: point[1].toFixed(4)});
 }, {passive: false});
 
 let text = '', flushTimer = null;
 function flush() {
   if (!text) return;
   const t = text; text = '';
-  send('/type', {text: t});
+  sendOrdered('/type', {text: t});
 }
 function modifiers(e) {
   const list = [];
@@ -257,17 +401,17 @@ addEventListener('keydown', e => {
     const name = chordKey(e);
     if (name) {
       e.preventDefault(); flush();
-      send('/key', {name, mods: held});
+      sendOrdered('/key', {name, mods: held});
     }
     return;
   }
   if (e.key.length === 1) {
     text += e.key;
     clearTimeout(flushTimer);
-    flushTimer = setTimeout(flush, 160);
+    flushTimer = setTimeout(flush, 20);
     e.preventDefault();
   } else if (KEYNAMES.has(e.key)) {
-    e.preventDefault(); flush(); send('/key', {name: e.key});
+    e.preventDefault(); flush(); sendOrdered('/key', {name: e.key});
   }
 });
 addEventListener('blur', flush);
@@ -275,13 +419,16 @@ addEventListener('blur', flush);
 let statsFailures = 0;
 setInterval(async () => {
   try {
+    const started = performance.now();
     const r = await fetch('/stats?t=' + token, {cache: 'no-store'});
     const s = await r.json();
+    const ping = Math.round(performance.now() - started);
     statsFailures = 0;
     const size = s.width ? s.width + 'x' + s.height : 'no frame';
     const stalled = s.alive === false;
-    log('desktop ' + size + '  capture ' + s.fps + ' fps' +
-        (stalled ? '  STALLED (capture stopped)' : '') + hint);
+    const encode = s.ms ? '  encode ' + Math.round(s.ms) + ' ms' : '';
+    log('desktop ' + size + '  capture ' + s.fps + ' fps  ping ' + ping + ' ms' +
+        encode + (stalled ? '  STALLED (capture stopped)' : '') + hint);
   } catch (err) {
     statsFailures += 1;
     log('stats error: ' + err.message + hint);
@@ -367,10 +514,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 # screen produces no frames, which is not a stall.
                 alive = ((beat_age is not None and beat_age < 5)
                          or (bool(stamp) and now - stamp < 3))
+                stat = streamer_stat()
                 payload = {"stamp": round(stamp, 3), "frames": STATS["frames"],
                            "fps": round(len(recent) / 2.0, 1),
                            "width": DIMS[0], "height": DIMS[1], "alive": alive,
-                           "age": round(now - stamp, 1) if stamp and data else None}
+                           "age": round(now - stamp, 1) if stamp and data else None,
+                           "ms": stat.get("ms"), "delivered": stat.get("delivered"),
+                           "encoded": stat.get("encoded"), "skipped": stat.get("skipped"),
+                           "dw": stat.get("dw"), "dh": stat.get("dh")}
             return self.send(json.dumps(payload), kind="application/json")
         if url.path in ("/frame.jpg", "/frame.png"):
             since = query.get("since", ["0"])[0]
@@ -397,59 +548,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(data, kind="image/jpeg",
                              extra={"X-Frame-Time": f"{stamp:.3f}"})
         if url.path in ("/click", "/rclick", "/down", "/move", "/up", "/scroll"):
-            width, height = dimensions(frame()[1])
+            width, height = display_size()
 
             def at():
                 fx = max(0.0, min(1.0, float(query.get("fx", ["0.5"])[0])))
                 fy = max(0.0, min(1.0, float(query.get("fy", ["0.5"])[0])))
-                return int(fx * width), int(fy * height)
+                return fx * width, fy * height
 
-            if url.path == "/scroll":
-                dy = int(float(query.get("dy", ["0"])[0]))
-                code = "121" if dy > 0 else "116"
-                for _ in range(min(5, max(1, abs(dy) // 3 or 1))):
-                    osa(f'tell application "System Events" to key code {code}')
-                return self.send(f"scroll {dy}")
             x, y = at()
-            if not CLICLICK:
-                return self.send("cliclick missing", status=503)
-            if url.path == "/click":
-                run([CLICLICK, f"c:{x},{y}"])
-            elif url.path == "/rclick":
-                run([CLICLICK, f"rc:{x},{y}"])
-            elif url.path == "/down":
-                run([CLICLICK, f"dd:{x},{y}"])
-            elif url.path == "/move":
-                run([CLICLICK, f"dm:{x},{y}"])
-            else:
-                run([CLICLICK, f"du:{x},{y}"])
-            return self.send(f"{url.path} {x},{y}")
+            if url.path == "/scroll":
+                dy = max(-240.0, min(240.0, float(query.get("dy", ["0"])[0])))
+                enqueue({"t": "scroll", "dy": dy, "x": x, "y": y})
+                return self.send(f"scroll {int(dy)}")
+            if url.path == "/move":
+                enqueue({"t": "mouse", "type": "drag", "x": x, "y": y})
+                return self.send(f"/move {int(x)},{int(y)}")
+            if url.path == "/down":
+                enqueue({"t": "mouse", "type": "down", "x": x, "y": y, "button": "left"})
+                return self.send(f"/down {int(x)},{int(y)}")
+            if url.path == "/up":
+                enqueue({"t": "mouse", "type": "up", "x": x, "y": y, "button": "left"})
+                return self.send(f"/up {int(x)},{int(y)}")
+            button = "right" if url.path == "/rclick" else "left"
+            try:
+                count = max(1, min(3, int(query.get("count", ["1"])[0] or 1)))
+            except ValueError:
+                count = 1
+            for state in range(1, count + 1):
+                enqueue({"t": "mouse", "type": "down", "x": x, "y": y,
+                         "button": button, "count": state})
+                enqueue({"t": "mouse", "type": "up", "x": x, "y": y,
+                         "button": button, "count": state})
+            return self.send(f"{url.path} {int(x)},{int(y)}")
         if url.path == "/type":
             text = query.get("text", [""])[0]
             if text:
-                escaped = text.replace("\\", "\\\\").replace('"', '\\"')
-                osa(f'tell application "System Events" to keystroke "{escaped}"')
+                enqueue({"t": "char", "s": text})
             return self.send(f"typed {len(text)}")
         if url.path == "/key":
             name = query.get("name", [""])[0]
             mods = [m for m in query.get("mods", [""])[0].split(",") if m in APPLE_MODIFIERS]
-            using = ""
             if mods:
-                using = " using {" + ", ".join(APPLE_MODIFIERS[m] for m in mods) + "}"
+                code = CHAR_CODES.get(name, KEYCODES.get(name))
+                if code is None:
+                    return self.send("unknown key", status=400)
+                enqueue({"t": "key", "code": code, "flags": mods})
+                return self.send(f"key {name} with {','.join(mods)}")
             if len(name) == 1:
-                escaped = name.replace("\\", "\\\\").replace('"', '\\"')
-                osa(f'tell application "System Events" to keystroke "{escaped}"{using}')
-                return self.send(f"key {name!r}{using}")
+                enqueue({"t": "char", "s": name})
+                return self.send(f"key {name!r}")
             code = KEYCODES.get(name)
             if code is None:
                 return self.send("unknown key", status=400)
-            osa(f'tell application "System Events" to key code {code}{using}')
-            return self.send(f"key {name}{using}")
+            enqueue({"t": "key", "code": code})
+            return self.send(f"key {name}")
         return self.send("not found", status=404)
 
 
 def main():
     threading.Thread(target=watch, daemon=True).start()
+    threading.Thread(target=input_worker, daemon=True).start()
     http.server.ThreadingHTTPServer.allow_reuse_address = True
     http.server.ThreadingHTTPServer.daemon_threads = True
     server = http.server.ThreadingHTTPServer((BIND, PORT), Handler)

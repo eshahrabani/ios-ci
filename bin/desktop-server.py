@@ -72,6 +72,7 @@ LOCK = threading.Lock()
 COND = threading.Condition(LOCK)
 CACHE = [0.0, b""]                      # mtime, bytes of the newest frame
 LAST_FULL = [b""]                       # newest full frame, for a viewer's first paint
+BARE_SEQ = [0]                          # header counter for headerless capture output
 STATS = {"frames": 0, "recent": []}     # capture timestamps in the last two seconds
 DIMS = [0, 0]
 KEYCODES = {
@@ -381,6 +382,13 @@ def watch():
         last = stamp
         with COND:
             _, data = frame_locked()
+            if data and not data.startswith(b"RECT "):
+                # The screencapture fallback writes a bare JPEG. Every such frame is a
+                # whole picture, so give it the header the page expects; a client that
+                # asks for a full frame just gets the next one.
+                width, height = dimensions(data)
+                BARE_SEQ[0] += 1
+                data = (f"RECT F 0 0 {width} {height} {BARE_SEQ[0]}\n".encode() + data)
             if data.startswith(b"RECT F "):
                 LAST_FULL[0] = data
             now = time.time()
@@ -520,7 +528,7 @@ PAGE = """<!doctype html><meta charset="utf-8">
 <style>
  html,body{margin:0;height:100%;background:#000;overflow:hidden;
    font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#9aa0a6}
- #screen{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;
+ #screen{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
    background:#000;cursor:crosshair;touch-action:none;user-select:none;
    -webkit-user-select:none;-webkit-user-drag:none}
  #hud{position:fixed;left:10px;bottom:10px;background:#000b;padding:6px 9px;
@@ -564,20 +572,22 @@ function needFull(urgent) {
   send({t: 'full'});
 }
 let streamWidth = 0, tuningAt = 0, stepDirection = 0, stepAt = 0;
-// A slow client (a software compositor, a weak link) paints far below the capture
-// rate, and every frame costs pixels twice over: once to decode and once to fill the
-// canvas. Step the capture size down until the paint rate fits, and back up when it
-// does. The server queues {"t":"config"} to the streamer, which restarts capture at
-// the new size and sends one full frame.
+let arrivalAt = [], displayWidth = 0;
+// A slow client paints far below the rate frames arrive, and every frame costs pixels
+// twice over: once to decode and once to fill the canvas. Compare what arrived with
+// what painted - not with the capture rate, which is also low when the screen is idle
+// - and step the size to the client. A client that keeps up grows back toward the
+// display's own width instead of stopping at an arbitrary cap.
 function tune() {
   const now = performance.now();
-  if (now - tuningAt < 6000 || !streamWidth) return;
-  const recent = shownAt.filter(t => now - t <= 2000);
-  if (recent.length < 6) return;         // an idle screen proves nothing
-  const shown = recent.length / 2;
+  arrivalAt = arrivalAt.filter(t => now - t <= 2000);
+  if (now - tuningAt < 6000 || !streamWidth || arrivalAt.length < 8) return;
+  const arrived = arrivalAt.length / 2;
+  const shown = shownAt.filter(t => now - t <= 2000).length / 2;
+  const cap = Math.max(560, Math.min(displayWidth || 960, 1440));
   let next = streamWidth;
-  if (shown < 12) next = Math.max(560, Math.round(streamWidth * 0.8 / 40) * 40);
-  else if (shown >= 27) next = Math.min(960, Math.round(streamWidth * 1.15 / 40) * 40);
+  if (shown < arrived * 0.6) next = Math.max(560, Math.round(streamWidth * 0.8 / 40) * 40);
+  else if (streamWidth < cap) next = Math.min(cap, Math.round(streamWidth * 1.15 / 40) * 40);
   if (next === streamWidth) return;
   // The restart itself starves the next window, so never reverse a step within 20 s.
   const up = next > streamWidth;
@@ -596,6 +606,7 @@ function connect() {
   ws.binaryType = 'blob';
   ws.onmessage = async event => {
     if (typeof event.data === 'string') return;
+    arrivalAt.push(performance.now());
     if (decoding) { needFull(true); return; }   // lost mid-decode: maybe the full
     decoding = true;
     try {
@@ -615,6 +626,7 @@ function connect() {
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;
+          fit();
         }
       } else if (!haveFull || seq !== lastSeq + 1) {
         needFull();
@@ -641,17 +653,23 @@ function send(message) {
   if (ws && ws.readyState === 1) ws.send(JSON.stringify(message));
 }
 
-function contentBox() {
+// One scale for both axes, centred: the picture keeps the screen's aspect, and the
+// menu bar and Dock are not stretched sideways. The element is sized to the picture,
+// so a pointer maps straight through its own box.
+function fit() {
   const nw = canvas.width, nh = canvas.height;
-  if (!nw || !nh) return null;
-  const ew = canvas.clientWidth || innerWidth, eh = canvas.clientHeight || innerHeight;
-  const scale = Math.min(ew / nw, eh / nh);
-  return [(ew - nw * scale) / 2, (eh - nh * scale) / 2, nw * scale, nh * scale];
+  if (!nw || !nh) return;
+  const scale = Math.min(innerWidth / nw, innerHeight / nh);
+  canvas.style.width = Math.round(nw * scale) + 'px';
+  canvas.style.height = Math.round(nh * scale) + 'px';
 }
+addEventListener('resize', fit);
+fit();
 function imageXY(e) {
-  const box = contentBox();
-  if (!box) return null;
-  return [(e.clientX - box[0]) / box[2], (e.clientY - box[1]) / box[3]];
+  const r = canvas.getBoundingClientRect();
+  if (!r.width || !r.height || !canvas.width || !canvas.height) return null;
+  return [(e.clientX - r.left) * canvas.width / r.width,
+          (e.clientY - r.top) * canvas.height / r.height];
 }
 
 let down = false, start = [0, 0], dragging = false;
@@ -752,6 +770,7 @@ setInterval(async () => {
     const s = await r.json();
     const ping = Math.round(performance.now() - started);
     statsFailures = 0;
+    if (s.dw) displayWidth = s.dw;
     const size = canvas.width ? canvas.width + 'x' + canvas.height : 'no frame';
     const stalled = s.alive === false;
     const encode = s.ms ? '  encode ' + Math.round(s.ms) + ' ms' : '';

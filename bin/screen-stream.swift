@@ -1,11 +1,13 @@
-// screen-stream.swift - stream the newest screen frame to a file as JPEG and inject input.
+// screen-stream.swift - stream the newest screen frame to a file and inject input.
 //
 //   screen-stream <out.jpg> [max-fps] [jpeg-quality] [max-width]
 //
 // `screencapture` costs ~0.15 s per invocation, so a capture loop tops out near 6 fps.
 // ScreenCaptureKit delivers compositor frames instead. Frames are written to <out>.tmp
-// and renamed, so a reader never sees a half-written JPEG (a truncated baseline JPEG
-// fails to decode in the browser). Each frame is a one-line header then a JPEG:
+// and renamed, so a reader never sees a half-written picture (a truncated file fails to
+// decode in the browser). Each frame is a one-line header then a JPEG or PNG: crops of
+// small regions go lossless, where JPEG's chroma subsampling would fringe the menu bar
+// and Dock text; full frames stay JPEG for size.
 //
 //   RECT F x y w h seq   full picture
 //   RECT P x y w h seq   only the rectangle that changed since the previous frame
@@ -47,8 +49,8 @@ let statPath = outPath + ".stat"
 var displayWidth = 0
 var displayHeight = 0
 
-func jpegData(_ buffer: CVPixelBuffer, quality: Double,
-              rect: (x: Int, y: Int, w: Int, h: Int)?) -> Data? {
+func imageData(_ buffer: CVPixelBuffer, type: UTType, quality: Double,
+               rect: (x: Int, y: Int, w: Int, h: Int)?) -> Data? {
     CVPixelBufferLockBaseAddress(buffer, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
@@ -89,9 +91,16 @@ func jpegData(_ buffer: CVPixelBuffer, quality: Double,
                               shouldInterpolate: false, intent: .defaultIntent) else { return nil }
     let data = NSMutableData()
     guard let destination = CGImageDestinationCreateWithData(
-        data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
-    CGImageDestinationAddImage(destination, image,
-        [kCGImageDestinationLossyCompressionQuality: NSNumber(value: quality)] as CFDictionary)
+        data, type.identifier as CFString, 1, nil) else { return nil }
+    // JPEG subsamples chroma and quantizes with 8x8 blocks: on 1 px text and on the
+    // translucent menu bar and Dock that reads as coloured fringes and banding, worse
+    // once the page scales the canvas. Small crops are cheap enough to send lossless,
+    // so the bars and a typing cursor never carry that noise.
+    var options: [String: Any] = [:]
+    if type != .png {
+        options[kCGImageDestinationLossyCompressionQuality as String] = NSNumber(value: quality)
+    }
+    CGImageDestinationAddImage(destination, image, options as CFDictionary)
     guard CGImageDestinationFinalize(destination) else { return nil }
     return data as Data
 }
@@ -196,7 +205,14 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
             }
             if changed && bottom >= top && right >= left {
-                box = (left, top, right - left + 1, bottom - top + 1)
+                // Snap to a 16 px grid: JPEG's 8x8 blocks (and its 2x2 chroma sampling)
+                // then sit on the same screen pixels in every crop, so a region
+                // re-encoded as part of different boxes cannot shimmer in colour.
+                let x0 = max(0, (left / 16) * 16)
+                let y0 = max(0, (top / 16) * 16)
+                let x1 = min(width, ((right + 16) / 16) * 16)
+                let y1 = min(height, ((bottom + 16) / 16) * 16)
+                box = (x0, y0, x1 - x0, y1 - y0)
             }
         }
         // Remember this frame as the client's picture, whatever we decide to send.
@@ -223,9 +239,14 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         let area = box.map { $0.w * $0.h } ?? (width * height)
         let keyframe = sinceFull >= 30          // about a second at 30 fps
         let full = keyframe || box == nil || area * 100 >= width * height * 60
+        // Crops cover the menu bar clock, the Dock, a cursor, typed text: lossless PNG
+        // costs a few kilobytes there and removes the chroma fringes entirely. A big
+        // change stays JPEG, where its size is what matters.
+        let lossless = !full && area * 4 <= width * height
         let started = DispatchTime.now().uptimeNanoseconds
-        guard let jpeg = jpegData(buffer, quality: quality,
-                                  rect: full ? nil : box) else { skipped += 1; return }
+        guard let picture = imageData(buffer, type: lossless ? .png : .jpeg,
+                                      quality: quality,
+                                      rect: full ? nil : box) else { skipped += 1; return }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         encodeMS = encodeMS == 0 ? ms : encodeMS * 0.8 + ms * 0.2
         // Every frame carries a sequence number: a crop only makes sense on top of the
@@ -241,7 +262,7 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
             header = "RECT P \(box!.x) \(box!.y) \(box!.w) \(box!.h) \(sequence)\n"
         }
         var payload = Data(header.utf8)
-        payload.append(jpeg)
+        payload.append(picture)
         write(payload)
         if encoded % 120 == 0 { err("frames \(encoded) \(payload.count) bytes \(Int(ms))ms") }
     }

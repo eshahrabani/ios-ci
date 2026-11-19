@@ -270,7 +270,7 @@ jobs:
           # dropped by the client. The page steps the width itself when it cannot
           # keep up (/config), so this is only the ceiling.
           if [[ -x "$STREAM" ]]; then
-            "$STREAM" "$FRAME" 30 0.45 960 >/dev/null 2>"$LOGS/screen-stream.log" &
+            "$STREAM" "$FRAME" 30 0.75 1440 >/dev/null 2>"$LOGS/screen-stream.log" &
             STREAM_PID=$!
             for _ in $(seq 1 40); do
               [[ -s "$FRAME" ]] && break

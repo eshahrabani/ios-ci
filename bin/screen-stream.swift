@@ -5,8 +5,15 @@
 // `screencapture` costs ~0.15 s per invocation, so a capture loop tops out near 6 fps.
 // ScreenCaptureKit delivers compositor frames instead. Frames are written to <out>.tmp
 // and renamed, so a reader never sees a half-written JPEG (a truncated baseline JPEG
-// fails to decode in the browser). A heartbeat file <out>.beat and a stat file
-// <out>.stat tell the server whether capture is alive and how fast it is.
+// fails to decode in the browser). Each frame is a one-line header then a JPEG:
+//
+//   RECT F x y w h seq   full picture
+//   RECT P x y w h seq   only the rectangle that changed since the previous frame
+//
+// A partial frame assumes its predecessor is on screen, so a reader that misses one
+// must skip partials and ask for a full frame (`{"t":"full"}` on the input socket);
+// one full frame is written every 60 frames regardless. A heartbeat <out>.beat and a
+// stat file <out>.stat tell the server whether capture is alive and how fast it is.
 //
 // Input is injected in-process over 127.0.0.1:<INPUT_PORT> (default 7777), one JSON
 // command per line. Spawning cliclick or osascript per event costs ~150 ms and lets
@@ -103,6 +110,8 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
     var previousWidth = 0
     var previousHeight = 0
     var forceFull = true
+    var sequence = 0
+    var sinceFull = 0
     var reportAt = 0.0
     var reportEncoded = 0
     var onStop: (() -> Void)?
@@ -186,17 +195,24 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         forceFull = false
         // A large change is cheaper as one full frame than as a crop plus headers.
         let area = box.map { $0.w * $0.h } ?? (width * height)
-        let full = box == nil || area * 100 >= width * height * 60
+        let keyframe = sinceFull >= 60          // about two seconds at 30 fps
+        let full = keyframe || box == nil || area * 100 >= width * height * 60
         let started = DispatchTime.now().uptimeNanoseconds
         guard let jpeg = jpegData(buffer, quality: quality,
                                   rect: full ? nil : box) else { skipped += 1; return }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         encodeMS = encodeMS == 0 ? ms : encodeMS * 0.8 + ms * 0.2
+        // Every frame carries a sequence number: a crop only makes sense on top of the
+        // frame before it, so a client that misses one must ask for a full frame
+        // instead of painting the next crop onto a stale picture. A keyframe every
+        // KEYFRAME_FRAMES heals a client even if the request is lost.
+        sequence += 1
+        sinceFull = full ? 0 : sinceFull + 1
         let header: String
         if full {
-            header = "RECT F 0 0 \(width) \(height)\n"
+            header = "RECT F 0 0 \(width) \(height) \(sequence)\n"
         } else {
-            header = "RECT P \(box!.x) \(box!.y) \(box!.w) \(box!.h)\n"
+            header = "RECT P \(box!.x) \(box!.y) \(box!.w) \(box!.h) \(sequence)\n"
         }
         var payload = Data(header.utf8)
         payload.append(jpeg)

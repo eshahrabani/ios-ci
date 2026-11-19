@@ -544,6 +544,19 @@ function log(message) { hud.textContent = message; }
 // TCP keeps the order, so a keystroke costs one one-way trip instead of a full
 // request/response round trip per character.
 let ws = null, decoding = false, haveFull = false, shownAt = [];
+let lastSeq = 0, fullAskedAt = 0;
+// A crop only composes onto the frame before it. When one is missed - the page was
+// still decoding, the server coalesced two frames, the decode failed - painting the
+// next crop would leave the missed change on screen forever, which looks like streaks
+// and torn regions. So a gap freezes the canvas and asks the streamer for a full
+// frame; one is also written every 60 frames, so the ask is a shortcut, not a need.
+function needFull() {
+  haveFull = false;
+  const now = performance.now();
+  if (now - fullAskedAt < 1000) return;
+  fullAskedAt = now;
+  send({t: 'full'});
+}
 let streamWidth = 0, tuningAt = 0, stepDirection = 0, stepAt = 0;
 // A slow client (a software compositor, a weak link) paints far below the capture
 // rate, and every frame costs pixels twice over: once to decode and once to fill the
@@ -577,29 +590,33 @@ function connect() {
   ws.binaryType = 'blob';
   ws.onmessage = async event => {
     if (typeof event.data === 'string') return;
-    if (decoding) return;              // always paint the newest frame, never a queue
+    if (decoding) { needFull(); return; }   // this frame is lost; the canvas is now stale
     decoding = true;
     try {
       const bytes = new Uint8Array(await event.data.arrayBuffer());
       let end = 0;
       while (end < bytes.length && bytes[end] !== 10) end++;
       const fields = new TextDecoder().decode(bytes.subarray(0, end)).split(' ');
-      if (fields[0] !== 'RECT' || fields.length !== 6) return;
+      if (fields[0] !== 'RECT' || fields.length !== 7) return;
       const full = fields[1] === 'F';
       const x = +fields[2], y = +fields[3], w = +fields[4], h = +fields[5];
-      if (w <= 0 || h <= 0) return;
+      const seq = +fields[6];
+      if (w <= 0 || h <= 0 || !seq) return;
       if (full) {
         haveFull = true;
+        lastSeq = seq;
         streamWidth = w;
         if (canvas.width !== w || canvas.height !== h) {
           canvas.width = w;
           canvas.height = h;
         }
-      } else if (!haveFull) {
-        return;                        // wait for the screen-defining frame
+      } else if (!haveFull || seq !== lastSeq + 1) {
+        needFull();
+        return;                        // a crop without its predecessor would streak
       }
       const bmp = await createImageBitmap(new Blob([bytes.subarray(end + 1)]));
       ctx.drawImage(bmp, x, y);
+      lastSeq = seq;
       bmp.close();
       const now = performance.now();
       shownAt.push(now);

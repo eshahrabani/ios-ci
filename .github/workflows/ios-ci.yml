@@ -390,7 +390,9 @@ jobs:
           # Accessibility for the injected events, and for the tools that post them.
           TCCDB="/Library/Application Support/com.apple.TCC/TCC.db"
           for client in "/usr/bin/python3" "$CLICLICK" "/bin/bash"; do
-            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceAccessibility','$client',1,2,0,1,0)" 2>&1 | head -1 || true
+            for service in kTCCServiceAccessibility kTCCServiceScreenCapture; do
+              sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('$service','$client',1,2,0,1,0)" 2>&1 | head -1 || true
+            done
           done
           sudo killall tccd 2>/dev/null || true
           sleep 1
@@ -426,6 +428,17 @@ jobs:
             exit 1
           fi
           echo "desktop server listening"
+          # The server's own interpreter needs the capture grant; if macOS still puts a
+          # modal prompt up, Return approves the default button and the pending capture
+          # completes instead of blocking every later frame and click.
+          curl -s -m 12 "http://${HOST}:6080/frame.png?t=${TOKEN}" -o "$RUNNER_TEMP/prime.png" || true
+          if [[ ! -s "$RUNNER_TEMP/prime.png" ]]; then
+            echo "capture blocked; approving the prompt"
+            sudo launchctl asuser "$CONSOLE_UID" "$CLICLICK" kp:return 2>&1 | head -2 || true
+            sleep 3
+            curl -s -m 15 "http://${HOST}:6080/frame.png?t=${TOKEN}" -o "$RUNNER_TEMP/prime.png" || true
+          fi
+          echo "prime frame bytes: $(stat -f%z "$RUNNER_TEMP/prime.png" 2>/dev/null || echo 0)"
 
           DESKTOP_URL="http://${HOST}:6080/?t=${TOKEN}"
           {

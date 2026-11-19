@@ -110,7 +110,8 @@ def frame():
 
 
 def screen_size():
-    data = frame()
+    # Never capture just to learn the size: a blocked capture would wedge input too.
+    data = LAST[1]
     if data[:8] != b"\x89PNG\r\n\x1a\n" or len(data) < 24:
         return 1024, 768
     return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")

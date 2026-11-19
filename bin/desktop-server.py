@@ -551,11 +551,14 @@ let lastSeq = 0, fullAskedAt = 0;
 // still decoding, the server coalesced two frames, the decode failed - painting the
 // next crop would leave the missed change on screen forever, which looks like streaks
 // and torn regions. So a gap freezes the canvas and asks the streamer for a full
-// frame; one is also written every 60 frames, so the ask is a shortcut, not a need.
+// frame; one is also written every 30 frames, so the ask is a shortcut, not a need.
 function needFull() {
+  const unresolved = !haveFull;
   haveFull = false;
   const now = performance.now();
-  if (now - fullAskedAt < 1000) return;
+  // Ask once per gap: the transition always asks, repeated calls back off to one a
+  // second so a long decode does not flood the agent.
+  if (unresolved && now - fullAskedAt < 1000) return;
   fullAskedAt = now;
   send({t: 'full'});
 }

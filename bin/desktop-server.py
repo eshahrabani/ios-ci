@@ -56,27 +56,42 @@ function frac(e) {
   const r = img.getBoundingClientRect();
   return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
 }
-img.addEventListener('mousedown', async e => {
-  const [fx, fy] = frac(e); last = [fx, fy]; down = true;
-  hud.textContent = 'down ' + fx.toFixed(3) + ',' + fy.toFixed(3);
-  await fetch('/down?fx=' + fx + '&fy=' + fy + '&t=' + token);
+let start = [0, 0], moved = false, dragging = false;
+async function send(path, fx, fy) {
+  try {
+    const r = await fetch(path + '?fx=' + fx + '&fy=' + fy + '&t=' + token);
+    hud.textContent = path + ' -> ' + (await r.text());
+  } catch (err) { hud.textContent = path + ' failed: ' + err.message; }
+}
+img.addEventListener('mousedown', e => {
+  const [fx, fy] = frac(e); start = [fx, fy]; last = [fx, fy];
+  down = true; moved = false; dragging = false;
 });
 img.addEventListener('mousemove', async e => {
   if (!down) return;
-  const now = Date.now(); if (now - lastMove < 150) return; lastMove = now;
-  const [fx, fy] = frac(e); last = [fx, fy];
-  await fetch('/move?fx=' + fx + '&fy=' + fy + '&t=' + token);
+  const [fx, fy] = frac(e);
+  if (Math.abs(fx - start[0]) * 1024 < 3 && Math.abs(fy - start[1]) * 768 < 3) return;
+  moved = true;
+  if (!dragging) {                 // a press that moved is a drag: start it once
+    dragging = true;
+    await send('/down', start[0], start[1]);
+  }
+  const now = Date.now(); if (now - lastMove < 120) return; lastMove = now;
+  last = [fx, fy];
+  await send('/move', fx, fy);
 });
 window.addEventListener('mouseup', async e => {
-  if (!down) return; down = false;
+  if (!down) return;
+  down = false;
   const [fx, fy] = frac(e); last = [fx, fy];
-  hud.textContent = 'up ' + fx.toFixed(3) + ',' + fy.toFixed(3);
-  await fetch('/up?fx=' + fx + '&fy=' + fy + '&t=' + token);
+  if (dragging) await send('/up', fx, fy);   // finish the drag
+  else await send('/click', fx, fy);         // plain click: one atomic c: event
+  dragging = false;
 });
-img.addEventListener('dblclick', async e => {
+img.addEventListener('contextmenu', async e => {
+  e.preventDefault();
   const [fx, fy] = frac(e);
-  await fetch('/click?fx=' + fx + '&fy=' + fy + '&t=' + token);
-  await fetch('/click?fx=' + fx + '&fy=' + fy + '&t=' + token);
+  await send('/rclick', fx, fy);
 });
 let typed = '';
 async function flush() { if (!typed) return; const t = typed; typed = '';
@@ -166,7 +181,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not data:
                 return self.send(b"capture failed", status=503)
             return self.send(data, kind="image/png")
-        if url.path in ("/click", "/down", "/move", "/up", "/drag"):
+        if url.path in ("/click", "/rclick", "/down", "/move", "/up", "/drag"):
             width, height = screen_size()
 
             def point(prefix):
@@ -190,6 +205,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.send(b"cliclick is not installed", status=503)
             if url.path == "/click":
                 run([CLICLICK, f"c:{x},{y}"])
+            elif url.path == "/rclick":
+                run([CLICLICK, f"rc:{x},{y}"])
             elif url.path == "/down":
                 run([CLICLICK, f"dd:{x},{y}"])
             elif url.path == "/move":

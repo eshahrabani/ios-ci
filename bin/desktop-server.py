@@ -10,16 +10,21 @@ this process only serves the newest one. Capturing from here would put this inte
 in the TCC responsibility chain, and macOS raises a modal consent dialog there that
 ignores synthetic input.
 
-The page holds one multipart/x-mixed-replace connection and the browser renders frames
-as they arrive: no polling latency, and a slow client simply sees fewer frames because
-the writer blocks (the next write always sends the newest frame).
+The page holds one WebSocket: frames come down as binary messages and input goes up as
+JSON. The writer always sends the newest frame and the page drops a frame if it is still
+painting the previous one, so a slow link shows the present instead of a backlog. Input
+is fire-and-forget: TCP keeps the order, and a keystroke costs one one-way trip, not a
+request/response round trip per character.
 """
+import base64
 import collections
+import hashlib
 import http.server
 import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -92,11 +97,20 @@ def streamer_stat():
         return {}
 
 
+DIMS_CACHE = [0.0, 1024, 768]
+
+
 def display_size():
+    now = time.time()
+    if DIMS_CACHE[0] > now:
+        return DIMS_CACHE[1], DIMS_CACHE[2]
     stat = streamer_stat()
     if stat.get("dw") and stat.get("dh"):
-        return int(stat["dw"]), int(stat["dh"])
-    return dimensions(frame()[1])
+        size = int(stat["dw"]), int(stat["dh"])
+    else:
+        size = dimensions(frame()[1])
+    DIMS_CACHE[:] = [now + 2.0, size[0], size[1]]
+    return size
 
 
 def input_socket():
@@ -250,6 +264,129 @@ def watch():
             COND.notify_all()
 
 
+WS_GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def recv_exact(sock, count):
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(count - len(buf))
+        if not chunk:
+            raise ConnectionError("peer closed")
+        buf += chunk
+    return buf
+
+
+def ws_frame(payload, opcode):
+    size = len(payload)
+    if size < 126:
+        head = bytes((0x80 | opcode, size))
+    elif size < 65536:
+        head = bytes((0x80 | opcode, 126)) + struct.pack(">H", size)
+    else:
+        head = bytes((0x80 | opcode, 127)) + struct.pack(">Q", size)
+    return head + payload
+
+
+def ws_message(sock):
+    """Read one client message; returns (opcode, payload) or None when closed."""
+    opcode = None
+    parts = []
+    while True:
+        b0, b1 = recv_exact(sock, 2)
+        fin = b0 & 0x80
+        op = b0 & 0x0F
+        masked = b1 & 0x80
+        size = b1 & 0x7F
+        if size == 126:
+            size = struct.unpack(">H", recv_exact(sock, 2))[0]
+        elif size == 127:
+            size = struct.unpack(">Q", recv_exact(sock, 8))[0]
+        mask = recv_exact(sock, 4) if masked else b"\0\0\0\0"
+        data = recv_exact(sock, size) if size else b""
+        if masked:
+            data = bytes(byte ^ mask[i & 3] for i, byte in enumerate(data))
+        if op == 0x8:
+            return None
+        if op == 0x9:
+            sock.sendall(ws_frame(data, 0xA))
+            continue
+        if op == 0xA:
+            continue
+        if op in (0x1, 0x2):
+            opcode = op
+            parts = [data]
+        elif op == 0x0:
+            parts.append(data)
+        if fin:
+            return opcode, b"".join(parts)
+
+
+def ws_items(event):
+    """Translate one client input message into agent commands, in order."""
+    kind = event.get("t")
+    width, height = display_size()
+
+    def point():
+        fx = max(0.0, min(1.0, float(event.get("fx", 0.5))))
+        fy = max(0.0, min(1.0, float(event.get("fy", 0.5))))
+        return fx * width, fy * height
+
+    if kind == "mouse":
+        x, y = point()
+        action = event.get("e")
+        if action == "drag":
+            return [{"t": "mouse", "type": "drag", "x": x, "y": y}]
+        if action == "down":
+            return [{"t": "mouse", "type": "down", "x": x, "y": y, "button": "left"}]
+        if action == "up":
+            return [{"t": "mouse", "type": "up", "x": x, "y": y, "button": "left"}]
+        if action in ("click", "rclick"):
+            button = "right" if action == "rclick" else "left"
+            try:
+                count = max(1, min(3, int(event.get("count", 1))))
+            except (TypeError, ValueError):
+                count = 1
+            out = []
+            for state in range(1, count + 1):
+                out.append({"t": "mouse", "type": "down", "x": x, "y": y,
+                            "button": button, "count": state})
+                out.append({"t": "mouse", "type": "up", "x": x, "y": y,
+                            "button": button, "count": state})
+            return out
+        return []
+    if kind == "wheel":
+        x, y = point()
+        try:
+            dy = max(-240.0, min(240.0, float(event.get("dy", 0))))
+        except (TypeError, ValueError):
+            return []
+        return [{"t": "scroll", "dy": dy, "x": x, "y": y}]
+    if kind == "type":
+        text = event.get("s", "")
+        return [{"t": "char", "s": text}] if text else []
+    if kind == "key":
+        name = event.get("name", "")
+        mods = [m for m in event.get("mods", "").split(",") if m in APPLE_MODIFIERS]
+        if mods:
+            code = CHAR_CODES.get(name, KEYCODES.get(name))
+            return [{"t": "key", "code": code, "flags": mods}] if code is not None else []
+        if len(name) == 1:
+            return [{"t": "char", "s": name}]
+        code = KEYCODES.get(name)
+        return [{"t": "key", "code": code}] if code is not None else []
+    if kind == "config":
+        item = {"t": "config"}
+        for key, cast in (("width", int), ("fps", float), ("quality", float)):
+            if key in event:
+                try:
+                    item[key] = cast(event[key])
+                except (TypeError, ValueError):
+                    pass
+        return [item] if len(item) > 1 else []
+    return []
+
+
 PAGE = """<!doctype html><meta charset="utf-8">
 <title>ios-ci desktop</title>
 <style>
@@ -261,10 +398,11 @@ PAGE = """<!doctype html><meta charset="utf-8">
  #hud{position:fixed;left:10px;bottom:10px;background:#000b;padding:6px 9px;
    border-radius:6px;white-space:pre;pointer-events:none}
 </style>
-<img id=screen alt="" draggable=false><div id=hud>connecting…</div>
+<canvas id=screen width=1024 height=768></canvas><div id=hud>connecting…</div>
 <script>
 const token = new URLSearchParams(location.search).get('t');
-const img = document.getElementById('screen');
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d', {alpha: false});
 const hud = document.getElementById('hud');
 const KEYNAMES = new Set(['Enter','Tab','Backspace','Delete','Escape','ArrowUp',
   'ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown',
@@ -275,16 +413,49 @@ const PUNCTUATION = {Minus:'-',Equal:'=',BracketLeft:'[',BracketRight:']',Backsl
 let hint = '';
 
 function log(message) { hud.textContent = message; }
+
+// One WebSocket carries frames down and input up. Input never waits for a reply:
+// TCP keeps the order, so a keystroke costs one one-way trip instead of a full
+// request/response round trip per character.
+let ws = null, decoding = false, shownAt = [];
 function connect() {
-  img.src = '/stream.mjpg?t=' + token + '&n=' + Math.random().toString(36).slice(2);
+  if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
+  const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(scheme + '://' + location.host + '/ws?t=' + encodeURIComponent(token));
+  ws.binaryType = 'blob';
+  ws.onmessage = async event => {
+    if (typeof event.data === 'string') return;
+    if (decoding) return;              // always paint the newest frame, never a queue
+    decoding = true;
+    try {
+      const bmp = await createImageBitmap(event.data);
+      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
+        canvas.width = bmp.width;
+        canvas.height = bmp.height;
+      }
+      ctx.drawImage(bmp, 0, 0);
+      bmp.close();
+      const now = performance.now();
+      shownAt.push(now);
+      while (shownAt.length && now - shownAt[0] > 2000) shownAt.shift();
+    } catch (err) {
+    } finally {
+      decoding = false;
+    }
+  };
+  ws.onclose = () => { ws = null; log('stream lost; reconnecting'); setTimeout(connect, 1000); };
+  ws.onerror = () => { try { ws.close(); } catch (err) {} };
 }
-img.addEventListener('error', () => { log('stream lost; reconnecting'); setTimeout(connect, 1500); });
 connect();
 
+function send(message) {
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(message));
+}
+
 function contentBox() {
-  const nw = img.naturalWidth, nh = img.naturalHeight;
+  const nw = canvas.width, nh = canvas.height;
   if (!nw || !nh) return null;
-  const ew = img.clientWidth || innerWidth, eh = img.clientHeight || innerHeight;
+  const ew = canvas.clientWidth || innerWidth, eh = canvas.clientHeight || innerHeight;
   const scale = Math.min(ew / nw, eh / nh);
   return [(ew - nw * scale) / 2, (eh - nh * scale) / 2, nw * scale, nh * scale];
 }
@@ -293,87 +464,55 @@ function imageXY(e) {
   if (!box) return null;
   return [(e.clientX - box[0]) / box[2], (e.clientY - box[1]) / box[3]];
 }
-async function send(path, params) {
-  try {
-    const query = new URLSearchParams(params);
-    query.set('t', token);
-    const r = await fetch(path + '?' + query);
-    hint = '  ' + (await r.text());
-  } catch (err) { hint = '  ' + path + ' failed'; }
-}
-// Keys and clicks must arrive in the order they were typed, and parallel fetches can
-// reach the server in any order. Moves and wheel deltas stay parallel: they are
-// coalesced on the server, where only the newest position matters.
-let ordered = Promise.resolve();
-function sendOrdered(path, params) {
-  ordered = ordered.then(() => send(path, params)).catch(() => {});
-  return ordered;
-}
 
 let down = false, start = [0, 0], dragging = false;
-img.addEventListener('pointerdown', e => {
+canvas.addEventListener('pointerdown', e => {
   if (e.button !== 0) return;          // right button belongs to contextmenu alone
   const point = imageXY(e);
   if (!point) return;
-  img.setPointerCapture(e.pointerId);
+  canvas.setPointerCapture(e.pointerId);
   start = point; down = true; dragging = false;
   e.preventDefault();
 });
-// One move in flight, always the newest: a drag follows the pointer at the link's
-// round-trip rate instead of queueing stale positions behind it.
-let movePending = null, moveScheduled = false;
-function queueMove(fx, fy) {
-  movePending = [fx, fy];
-  if (moveScheduled) return;
-  moveScheduled = true;
-  const step = () => {
-    if (!movePending) { moveScheduled = false; return; }
-    const p = movePending;
-    movePending = null;
-    ordered = ordered.then(() => send('/move', {fx: p[0], fy: p[1]})).catch(() => {});
-    ordered.then(step);
-  };
-  step();
-}
-img.addEventListener('pointermove', e => {
+canvas.addEventListener('pointermove', e => {
   if (!down) return;
   const point = imageXY(e);
   if (!point) return;
   const [fx, fy] = point;
-  if (!dragging && Math.abs(fx - start[0]) * img.naturalWidth < 3 &&
-      Math.abs(fy - start[1]) * img.naturalHeight < 3) return;
-  if (!dragging) { dragging = true; sendOrdered('/down', {fx: start[0], fy: start[1]}); }
-  queueMove(fx, fy);
+  if (!dragging && Math.abs(fx - start[0]) * canvas.width < 3 &&
+      Math.abs(fy - start[1]) * canvas.height < 3) return;
+  if (!dragging) { dragging = true; send({t:'mouse', e:'down', fx:start[0], fy:start[1]}); }
+  send({t:'mouse', e:'drag', fx, fy});
 });
-img.addEventListener('pointerup', e => {
+canvas.addEventListener('pointerup', e => {
   if (e.button !== 0 || !down) return;
   down = false;
   const point = imageXY(e);
   if (!point) return;
-  if (dragging) sendOrdered('/up', {fx: point[0], fy: point[1]});
-  else sendOrdered('/click', {fx: point[0], fy: point[1], count: e.detail || 1});
+  if (dragging) send({t:'mouse', e:'up', fx:point[0], fy:point[1]});
+  else send({t:'mouse', e:'click', fx:point[0], fy:point[1], count:e.detail || 1});
   dragging = false;
 });
-img.addEventListener('pointercancel', () => { down = false; dragging = false; });
-img.addEventListener('dragstart', e => e.preventDefault());
-img.addEventListener('contextmenu', e => {
+canvas.addEventListener('pointercancel', () => { down = false; dragging = false; });
+canvas.addEventListener('dragstart', e => e.preventDefault());
+canvas.addEventListener('contextmenu', e => {
   e.preventDefault();
   const point = imageXY(e);
-  if (point) sendOrdered('/rclick', {fx: point[0], fy: point[1]});
+  if (point) send({t:'mouse', e:'rclick', fx:point[0], fy:point[1]});
 });
-img.addEventListener('wheel', e => {
+canvas.addEventListener('wheel', e => {
   e.preventDefault();
   const point = imageXY(e) || [0.5, 0.5];
   const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 400 : 1;
   const dy = Math.round(Math.max(-240, Math.min(240, e.deltaY * unit)));
-  send('/scroll', {dy, fx: point[0].toFixed(4), fy: point[1].toFixed(4)});
+  send({t:'wheel', dy, fx:point[0], fy:point[1]});
 }, {passive: false});
 
 let text = '', flushTimer = null;
 function flush() {
   if (!text) return;
   const t = text; text = '';
-  sendOrdered('/type', {text: t});
+  send({t:'type', s:t});
 }
 function modifiers(e) {
   const list = [];
@@ -401,7 +540,7 @@ addEventListener('keydown', e => {
     const name = chordKey(e);
     if (name) {
       e.preventDefault(); flush();
-      sendOrdered('/key', {name, mods: held});
+      send({t:'key', name, mods:held});
     }
     return;
   }
@@ -411,7 +550,7 @@ addEventListener('keydown', e => {
     flushTimer = setTimeout(flush, 20);
     e.preventDefault();
   } else if (KEYNAMES.has(e.key)) {
-    e.preventDefault(); flush(); sendOrdered('/key', {name: e.key});
+    e.preventDefault(); flush(); send({t:'key', name:e.key});
   }
 });
 addEventListener('blur', flush);
@@ -427,8 +566,10 @@ setInterval(async () => {
     const size = s.width ? s.width + 'x' + s.height : 'no frame';
     const stalled = s.alive === false;
     const encode = s.ms ? '  encode ' + Math.round(s.ms) + ' ms' : '';
-    log('desktop ' + size + '  capture ' + s.fps + ' fps  ping ' + ping + ' ms' +
-        encode + (stalled ? '  STALLED (capture stopped)' : '') + hint);
+    const now = performance.now();
+    const shown = shownAt.filter(t => now - t <= 2000).length / 2;
+    log('desktop ' + size + '  show ' + shown.toFixed(1) + ' fps  capture ' + s.fps +
+        ' fps  ping ' + ping + ' ms' + encode + (stalled ? '  STALLED (capture stopped)' : '') + hint);
   } catch (err) {
     statsFailures += 1;
     log('stats error: ' + err.message + hint);
@@ -489,6 +630,75 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             sent = stamp
 
+    def websocket(self):
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key:
+            return self.send("websocket upgrade required", status=400)
+        accept = base64.b64encode(hashlib.sha1(key.encode() + WS_GUID).digest()).decode()
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        self.wfile.flush()
+        self.close_connection = True
+        sock = self.connection
+        sock.settimeout(25)
+        stop = threading.Event()
+        lock = threading.Lock()
+        threading.Thread(target=self.ws_frames, args=(sock, stop, lock),
+                         daemon=True).start()
+        try:
+            while not stop.is_set():
+                try:
+                    message = ws_message(sock)
+                except TimeoutError:
+                    try:
+                        with lock:
+                            sock.sendall(ws_frame(b"", 0x9))   # keepalive ping
+                    except OSError:
+                        break
+                    continue
+                if message is None:
+                    break
+                opcode, data = message
+                if opcode != 0x1:
+                    continue
+                try:
+                    event = json.loads(data)
+                except ValueError:
+                    continue
+                for item in ws_items(event):
+                    enqueue(item)
+        except (OSError, ConnectionError):
+            pass
+        finally:
+            stop.set()
+
+    def ws_frames(self, sock, stop, lock):
+        """Send the newest frame; a slow link skips frames instead of queueing them."""
+        sent = None
+        while not stop.is_set():
+            with COND:
+                deadline = time.time() + 1.0
+                while not stop.is_set():
+                    stamp, data = frame_locked()
+                    if data and stamp != sent:
+                        break
+                    left = deadline - time.time()
+                    if left <= 0:
+                        break
+                    COND.wait(left)
+            if stop.is_set() or not data or stamp == sent:
+                continue
+            try:
+                with lock:
+                    sock.sendall(ws_frame(data, 0x2))
+            except OSError:
+                stop.set()
+                return
+            sent = stamp
+
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
@@ -496,6 +706,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send("forbidden", status=403)
         if url.path == "/":
             return self.send(PAGE.encode(), kind="text/html; charset=utf-8")
+        if url.path == "/ws":
+            try:
+                return self.websocket()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
         if url.path == "/stream.mjpg":
             try:
                 return self.stream_frames()

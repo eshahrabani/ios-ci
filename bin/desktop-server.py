@@ -45,6 +45,7 @@ INPUT_COND = threading.Condition()
 LOCK = threading.Lock()
 COND = threading.Condition(LOCK)
 CACHE = [0.0, b""]                      # mtime, bytes of the newest frame
+LAST_FULL = [b""]                       # newest full frame, for a viewer's first paint
 STATS = {"frames": 0, "recent": []}     # capture timestamps in the last two seconds
 DIMS = [0, 0]
 KEYCODES = {
@@ -203,6 +204,13 @@ def input_worker():
 
 
 def dimensions(data):
+    if not data.startswith(b"\xff\xd8") and not data.startswith(b"\x89PNG"):
+        # Frames may carry a "RECT ...\n" header; measure the image, not the header.
+        start = data.find(b"\xff\xd8")
+        if start < 0:
+            start = data.find(b"\x89PNG")
+        if start > 0:
+            data = data[start:]
     if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
         return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
     if data[:2] == b"\xff\xd8":            # JPEG: walk to the first SOF frame header
@@ -257,6 +265,8 @@ def watch():
         last = stamp
         with COND:
             _, data = frame_locked()
+            if data.startswith(b"RECT F "):
+                LAST_FULL[0] = data
             now = time.time()
             STATS["frames"] += 1
             STATS["recent"] = [t for t in STATS["recent"] if now - t <= 2.0] + [now]
@@ -417,7 +427,7 @@ function log(message) { hud.textContent = message; }
 // One WebSocket carries frames down and input up. Input never waits for a reply:
 // TCP keeps the order, so a keystroke costs one one-way trip instead of a full
 // request/response round trip per character.
-let ws = null, decoding = false, shownAt = [];
+let ws = null, decoding = false, haveFull = false, shownAt = [];
 function connect() {
   if (ws && (ws.readyState === 0 || ws.readyState === 1)) return;
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -428,12 +438,25 @@ function connect() {
     if (decoding) return;              // always paint the newest frame, never a queue
     decoding = true;
     try {
-      const bmp = await createImageBitmap(event.data);
-      if (canvas.width !== bmp.width || canvas.height !== bmp.height) {
-        canvas.width = bmp.width;
-        canvas.height = bmp.height;
+      const bytes = new Uint8Array(await event.data.arrayBuffer());
+      let end = 0;
+      while (end < bytes.length && bytes[end] !== 10) end++;
+      const fields = new TextDecoder().decode(bytes.subarray(0, end)).split(' ');
+      if (fields[0] !== 'RECT' || fields.length !== 6) return;
+      const full = fields[1] === 'F';
+      const x = +fields[2], y = +fields[3], w = +fields[4], h = +fields[5];
+      if (w <= 0 || h <= 0) return;
+      if (full) {
+        haveFull = true;
+        if (canvas.width !== w || canvas.height !== h) {
+          canvas.width = w;
+          canvas.height = h;
+        }
+      } else if (!haveFull) {
+        return;                        // wait for the screen-defining frame
       }
-      ctx.drawImage(bmp, 0, 0);
+      const bmp = await createImageBitmap(new Blob([bytes.subarray(end + 1)]));
+      ctx.drawImage(bmp, x, y);
       bmp.close();
       const now = performance.now();
       shownAt.push(now);
@@ -563,7 +586,7 @@ setInterval(async () => {
     const s = await r.json();
     const ping = Math.round(performance.now() - started);
     statsFailures = 0;
-    const size = s.width ? s.width + 'x' + s.height : 'no frame';
+    const size = canvas.width ? canvas.width + 'x' + canvas.height : 'no frame';
     const stalled = s.alive === false;
     const encode = s.ms ? '  encode ' + Math.round(s.ms) + ' ms' : '';
     const now = performance.now();
@@ -646,8 +669,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sock.settimeout(25)
         stop = threading.Event()
         lock = threading.Lock()
+        try:
+            if LAST_FULL[0]:
+                with lock:
+                    sock.sendall(ws_frame(LAST_FULL[0], 0x2))
+        except OSError:
+            return
         threading.Thread(target=self.ws_frames, args=(sock, stop, lock),
                          daemon=True).start()
+        # A new viewer starts with no picture: ask the capture for a full frame.
+        enqueue({"t": "full"})
         try:
             while not stop.is_set():
                 try:
@@ -732,7 +763,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 stat = streamer_stat()
                 payload = {"stamp": round(stamp, 3), "frames": STATS["frames"],
                            "fps": round(len(recent) / 2.0, 1),
-                           "width": DIMS[0], "height": DIMS[1], "alive": alive,
+                           "width": stat.get("dw") or DIMS[0],
+                           "height": stat.get("dh") or DIMS[1], "alive": alive,
                            "age": round(now - stamp, 1) if stamp and data else None,
                            "ms": stat.get("ms"), "delivered": stat.get("delivered"),
                            "encoded": stat.get("encoded"), "skipped": stat.get("skipped"),

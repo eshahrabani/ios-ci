@@ -40,7 +40,8 @@ let statPath = outPath + ".stat"
 var displayWidth = 0
 var displayHeight = 0
 
-func jpegData(_ buffer: CVPixelBuffer, quality: Double) -> Data? {
+func jpegData(_ buffer: CVPixelBuffer, quality: Double,
+              rect: (x: Int, y: Int, w: Int, h: Int)?) -> Data? {
     CVPixelBufferLockBaseAddress(buffer, .readOnly)
     defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
     guard let base = CVPixelBufferGetBaseAddress(buffer) else { return nil }
@@ -48,12 +49,33 @@ func jpegData(_ buffer: CVPixelBuffer, quality: Double) -> Data? {
     let height = CVPixelBufferGetHeight(buffer)
     let stride = CVPixelBufferGetBytesPerRow(buffer)
     guard stride >= width * 4 else { return nil }
+    let box = rect ?? (0, 0, width, height)
+    guard box.w > 0, box.h > 0, box.x >= 0, box.y >= 0,
+          box.x + box.w <= width, box.y + box.h <= height else { return nil }
     let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
         | CGBitmapInfo.byteOrder32Little.rawValue)
-    guard let provider = CGDataProvider(dataInfo: nil, data: base, size: stride * height,
-                                        releaseData: { _, _, _ in }) else { return nil }
-    guard let image = CGImage(width: width, height: height, bitsPerComponent: 8,
-                              bitsPerPixel: 32, bytesPerRow: stride,
+    let rowBytes = box.w * 4
+    let provider: CGDataProvider
+    if rect == nil {
+        guard let whole = CGDataProvider(dataInfo: nil, data: base, size: stride * height,
+                                         releaseData: { _, _, _ in }) else { return nil }
+        provider = whole
+    } else {
+        let bytes = UnsafeMutableRawPointer.allocate(byteCount: rowBytes * box.h,
+                                                     alignment: 64)
+        for row in 0..<box.h {
+            memcpy(bytes + row * rowBytes, base + (box.y + row) * stride + box.x * 4,
+                   rowBytes)
+        }
+        guard let crop = CGDataProvider(
+            dataInfo: nil, data: bytes, size: rowBytes * box.h,
+            releaseData: { _, data, _ in
+                UnsafeMutableRawPointer(mutating: data).deallocate()
+            }) else { return nil }
+        provider = crop
+    }
+    guard let image = CGImage(width: box.w, height: box.h, bitsPerComponent: 8,
+                              bitsPerPixel: 32, bytesPerRow: rowBytes,
                               space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info,
                               provider: provider, decode: nil,
                               shouldInterpolate: false, intent: .defaultIntent) else { return nil }
@@ -76,6 +98,10 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
     var delivered = 0
     var skipped = 0
     var encodeMS = 0.0
+    var previous: [UInt8]?
+    var previousWidth = 0
+    var previousHeight = 0
+    var forceFull = true
     var reportAt = 0.0
     var reportEncoded = 0
     var onStop: (() -> Void)?
@@ -94,19 +120,86 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         let now = Date().timeIntervalSince1970
         if interval > 0 && now - last < interval { skipped += 1; return }
         last = now          // arrival time: the encode itself must not lower the rate
-        // No freshness filter here: the queue depth bounds the backlog, and a clock
-        // comparison rejected every frame while a Metal-heavy app was on screen,
-        // which froze the stream exactly when the tester needed it.
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             skipped += 1
             return
         }
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(buffer) else { skipped += 1; return }
+        let width = CVPixelBufferGetWidth(buffer)
+        let height = CVPixelBufferGetHeight(buffer)
+        let stride = CVPixelBufferGetBytesPerRow(buffer)
+        let rowBytes = width * 4
+
+        // Diff against the last frame the client was sent: an unchanged frame costs
+        // nothing, and a changed one carries only the rectangle that changed. A
+        // terminal keystroke is a few kilobytes instead of a full-screen JPEG.
+        var changed = forceFull
+        var box: (x: Int, y: Int, w: Int, h: Int)? = nil
+        if !forceFull, let old = previous, previousWidth == width,
+           previousHeight == height {
+            var top = height, bottom = -1, left = width, right = -1
+            old.withUnsafeBufferPointer { prev in
+                guard let prevBase = prev.baseAddress else { return }
+                for y in 0..<height {
+                    let current = base + y * stride
+                    let oldRow = prevBase + y * rowBytes
+                    if memcmp(current, oldRow, rowBytes) == 0 { continue }
+                    changed = true
+                    if y < top { top = y }
+                    bottom = y
+                    let a = current.assumingMemoryBound(to: UInt32.self)
+                    let b = oldRow.assumingMemoryBound(to: UInt32.self)
+                    var x0 = 0
+                    while x0 < width && a[x0] == b[x0] { x0 += 1 }
+                    var x1 = width - 1
+                    while x1 > x0 && a[x1] == b[x1] { x1 -= 1 }
+                    if x0 < left { left = x0 }
+                    if x1 > right { right = x1 }
+                }
+            }
+            if changed && bottom >= top && right >= left {
+                box = (left, top, right - left + 1, bottom - top + 1)
+            }
+        }
+        // Remember this frame as the client's picture, whatever we decide to send.
+        var copy = previous ?? []
+        if copy.count != rowBytes * height {
+            copy = [UInt8](repeating: 0, count: rowBytes * height)
+        }
+        copy.withUnsafeMutableBufferPointer { out in
+            guard let outBase = out.baseAddress else { return }
+            for y in 0..<height {
+                memcpy(outBase + y * rowBytes, base + y * stride, rowBytes)
+            }
+        }
+        previous = copy
+        previousWidth = width
+        previousHeight = height
+        if !changed {
+            skipped += 1
+            return
+        }
+        forceFull = false
+        // A large change is cheaper as one full frame than as a crop plus headers.
+        let area = box.map { $0.w * $0.h } ?? (width * height)
+        let full = box == nil || area * 100 >= width * height * 60
         let started = DispatchTime.now().uptimeNanoseconds
-        guard let data = jpegData(buffer, quality: quality) else { skipped += 1; return }
+        guard let jpeg = jpegData(buffer, quality: quality,
+                                  rect: full ? nil : box) else { skipped += 1; return }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         encodeMS = encodeMS == 0 ? ms : encodeMS * 0.8 + ms * 0.2
+        let header: String
+        if full {
+            header = "RECT F 0 0 \(width) \(height)\n"
+        } else {
+            header = "RECT P \(box!.x) \(box!.y) \(box!.w) \(box!.h)\n"
+        }
+        var payload = Data(header.utf8)
+        payload.append(jpeg)
         do {
-            try data.write(to: URL(fileURLWithPath: temporary))
+            try payload.write(to: URL(fileURLWithPath: temporary))
         } catch {
             err("write failed: \(error.localizedDescription)")
             return
@@ -114,7 +207,7 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         let renamed = temporary.withCString { from in path.withCString { to in rename(from, to) } }
         if renamed != 0 { return }
         encoded += 1
-        if encoded % 120 == 0 { err("frames \(encoded) \(data.count) bytes \(Int(ms))ms") }
+        if encoded % 120 == 0 { err("frames \(encoded) \(payload.count) bytes \(Int(ms))ms") }
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -239,6 +332,8 @@ final class InputAgent {
             mouse(message)
         case "scroll":
             scroll(message)
+        case "full":
+            DispatchQueue.main.async { sinkRef?.forceFull = true }
         case "config":
             if let width = message["width"] as? Int, width > 0 { maxWidth = width }
             if let fps = message["fps"] as? Double, fps >= 1 { maxFPS = min(120, fps) }

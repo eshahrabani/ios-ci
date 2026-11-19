@@ -3,7 +3,12 @@
 
 Run in the console session (so clicks and keys reach the GUI):
 
-    launchctl asuser <uid> python3 desktop-server.py <port> <token> <host>
+    launchctl asuser <uid> python3 desktop-server.py <port> <token-hash> <host>
+
+The second argument is the lowercase hex SHA-256 of the session token, never the token
+itself: the hash is what the workflow was dispatched with, so a run's metadata is not
+an access credential. A request carries the token in `?t=` and is served only when its
+hash matches.
 
 Frames are written by a separate capture process (bin/screen-stream.swift) to FRAME;
 this process only serves the newest one. Capturing from here would put this interpreter
@@ -16,12 +21,17 @@ painting the previous one, so a slow link shows the present instead of a backlog
 is fire-and-forget: TCP keeps the order, and a keystroke costs one one-way trip, not a
 request/response round trip per character.
 
+`/stats` reports liveness and, through the flags the workflow's self-test writes, whether
+input was verified: `input_checked` says the probe ran, `input_ok` says the click changed
+the screen. A client turns its light green only when frames and input both work.
+
 Uploads go the other way: POST /upload?t=<token>&name=<dir> stores a tar.gz in the
 tester's home, so a directory from their machine appears inside the session.
 """
 import base64
 import collections
 import hashlib
+import hmac
 import http.server
 import json
 import os
@@ -38,11 +48,18 @@ import time
 import urllib.parse
 
 PORT = int(sys.argv[1])
-TOKEN = sys.argv[2]
+# Only the SHA-256 of the session token reaches the runner: it is a workflow input,
+# visible in the run's metadata, and a raw token there would be the access credential.
+TOKEN_HASH = sys.argv[2].lower()
+if not re.fullmatch(r"[0-9a-f]{64}", TOKEN_HASH):
+    print("token hash must be 64 hex chars", file=sys.stderr)
+    sys.exit(2)
 BIND = sys.argv[3] if len(sys.argv) > 3 else "0.0.0.0"
 FRAME = "/tmp/desktop-frame.jpg"
 BEAT = FRAME + ".beat"                  # touched every second by the capture process
 STAT = FRAME + ".stat"                  # capture counters written by the same process
+INPUT_OK = "/tmp/desktop-input-ok"      # the workflow's self-test saw the click land
+INPUT_CHECKED = "/tmp/desktop-input-checked"   # the self-test ran at all
 UPLOAD_MAX = 4 * 1024 ** 3              # refuse anything larger: 4 GiB of tar.gz
 UPLOAD_CHUNK = 1024 * 1024
 UPLOAD_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
@@ -701,6 +718,12 @@ setInterval(async () => {
 </script>"""
 
 
+def allowed(value):
+    """True when the presented token hashes to the dispatched hash."""
+    digest = hashlib.sha256((value or "").encode()).hexdigest()
+    return hmac.compare_digest(digest, TOKEN_HASH)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -832,7 +855,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
-        if query.get("t", [""])[0] != TOKEN:
+        if not allowed(query.get("t", [""])[0]):
             return self.send("forbidden", status=403)
         if url.path == "/":
             return self.send(PAGE.encode(), kind="text/html; charset=utf-8")
@@ -864,6 +887,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "fps": round(len(recent) / 2.0, 1),
                            "width": stat.get("dw") or DIMS[0],
                            "height": stat.get("dh") or DIMS[1], "alive": alive,
+                           "input_ok": os.path.exists(INPUT_OK),
+                           "input_checked": os.path.exists(INPUT_CHECKED),
                            "age": round(now - stamp, 1) if stamp and data else None,
                            "ms": stat.get("ms"), "delivered": stat.get("delivered"),
                            "encoded": stat.get("encoded"), "skipped": stat.get("skipped"),
@@ -982,7 +1007,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
-        if query.get("t", [""])[0] != TOKEN:
+        if not allowed(query.get("t", [""])[0]):
             return self.send("forbidden", status=403)
         if url.path != "/upload":
             return self.send("not found", status=404)

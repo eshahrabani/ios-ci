@@ -1,504 +1,206 @@
 name: ios-ci
 run-name: ios-ci ${{ inputs.correlation_id }}
 
+# One job, one deliverable: a macOS desktop that a browser can drive, ready in about a
+# minute. Nothing is checked out and nothing is opened in the VM. The tester's machine
+# reaches the runner over the tailnet; the session token never leaves it — only the
+# token's SHA-256 is dispatched, and the server compares hashes in constant time.
 on:
   workflow_dispatch:
     inputs:
-      sha:
-        description: Commit SHA in the private app repository
-        required: true
-        type: string
-      ref:
-        description: Private branch/tag name (diagnostics only)
-        required: false
-        default: main
-        type: string
       correlation_id:
-        description: Unique ID used by the private repo to find this run
+        description: Unique ID the GUI/CLI uses to find this run
         required: true
         type: string
-      smoke_text:
-        description: Text visible on the app's first screen
+      session_minutes:
+        description: Minutes to hold the desktop after it is ready (1-300)
         required: true
+        default: '30'
         type: string
-      debug_public_logs:
-        description: Print raw app build/test output to the public log
-        required: false
-        default: false
-        type: boolean
-      manual_minutes:
-        description: Minutes to hold a VNC desktop session on the hosted runner (0 disables; max 300)
-        required: false
-        default: '0'
-        type: string
-      node_version:
-        description: Node.js version installed on the runner
-        required: false
-        default: '22'
-        type: string
-      boot_config:
-        description: JSON applied before a manual desktop opens (xcode, simulator, brew, script)
-        required: false
-        default: '{}'
+      session_token_hash:
+        description: Lowercase hex SHA-256 of the session token
+        required: true
         type: string
 
 permissions:
   contents: read
 
 concurrency:
-  # Normal runs keep cancelling each other, but a manual session must survive an
-  # unrelated dispatch: it gets its own group, so nothing cancels the desktop or
-  # the node someone is connected to.
-  group: ios-ci-${{ inputs.manual_minutes != '0' && github.run_id || 'main' }}
-  cancel-in-progress: true
+  # Every session gets its own group: a desktop someone is working in must not be
+  # cancelled by an unrelated dispatch.
+  group: ios-ci-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  # Actions expressions have no arithmetic (no `+`), and job timeout-minutes cannot
-  # read env, so the manual schedule is computed here. A manual run gets
-  # 60 + manual_minutes for the job (60 for checkout/build/Maestro/VNC setup plus the
-  # hold) and manual_minutes + 10 for the hold step. Normal runs keep 45.
-  plan:
-    name: plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      job_timeout: ${{ steps.compute.outputs.job_timeout }}
-      hold_timeout: ${{ steps.compute.outputs.hold_timeout }}
+  macos-desktop:
+    name: macos-desktop
+    runs-on: macos-26
+    # GitHub caps hosted jobs at 360 minutes; the hold is at most 300 plus setup.
+    timeout-minutes: 360
+    env:
+      SESSION_MINUTES: ${{ inputs.session_minutes }}
+      SESSION_TOKEN_HASH: ${{ inputs.session_token_hash }}
     steps:
-      - id: compute
-        env:
-          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
+      - name: Validate the session length
         run: |
           set -euo pipefail
-          if [[ "$MANUAL_MINUTES" == "0" ]]; then
-            echo "job_timeout=45" >> "$GITHUB_OUTPUT"
-            echo "hold_timeout=10" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [[ ! "$MANUAL_MINUTES" =~ ^[0-9]+$ ]]; then
-            echo "manual_minutes must be a whole number of minutes, got '$MANUAL_MINUTES'"
+          if [[ ! "$SESSION_MINUTES" =~ ^[0-9]+$ ]]; then
+            echo "session_minutes must be a whole number of minutes, got '$SESSION_MINUTES'"
             exit 1
           fi
           # 10# keeps a leading zero from being read as octal.
-          MINUTES=$((10#$MANUAL_MINUTES))
-          echo "job_timeout=$((MINUTES + 60))" >> "$GITHUB_OUTPUT"
-          echo "hold_timeout=$((MINUTES + 10))" >> "$GITHUB_OUTPUT"
+          MINUTES=$((10#$SESSION_MINUTES))
+          if (( MINUTES < 1 || MINUTES > 300 )); then
+            echo "session_minutes must be 1-300, got $MINUTES"
+            exit 1
+          fi
+          if [[ ! "$SESSION_TOKEN_HASH" =~ ^[0-9a-fA-F]{64}$ ]]; then
+            echo "session_token_hash must be 64 hex characters (the SHA-256 of the session token), got ${#SESSION_TOKEN_HASH} characters"
+            exit 1
+          fi
+          echo "SESSION_MINUTES=$MINUTES" >> "$GITHUB_ENV"
+          echo "session: ${MINUTES} minutes"
 
-  ios:
-    name: ios-simulator
-    needs: plan
-    # A manual run holds a VNC desktop on the Intel image; normal runs stay on ARM
-    # with the 45-minute cap. GitHub caps hosted jobs at 360 minutes, and the CLI
-    # caps --manual at 300, so 60 + manual_minutes never exceeds that ceiling.
-    runs-on: macos-26
-    timeout-minutes: ${{ fromJSON(needs.plan.outputs.job_timeout) }}
-    env:
-      DEBUG_PUBLIC_LOGS: ${{ inputs.debug_public_logs }}
-      MANUAL_MINUTES: ${{ inputs.manual_minutes }}
-    steps:
-      - name: Checkout private app
-        uses: actions/checkout@v7
+      # The streamer is a Swift build against ScreenCaptureKit: ~25 s on this image,
+      # and it only changes when bin/screen-stream.swift does. Keyed by commit so a
+      # second session at the same revision restores the binary instead of rebuilding.
+      - name: Restore the screen streamer
+        uses: actions/cache@v4
         with:
-          repository: ${{ secrets.APP_REPO }}
-          ref: ${{ inputs.sha }}
-          ssh-key: ${{ secrets.APP_DEPLOY_KEY }}
-          path: app
-          fetch-depth: 1
-          persist-credentials: false
+          path: ${{ runner.temp }}/screen-stream
+          key: screen-stream-${{ runner.os }}-${{ runner.arch }}-${{ github.sha }}
 
-      # actions/checkout leaves the deploy key on disk for the whole job even with
-      # persist-credentials: false. Nothing below this point needs it, and npm
-      # postinstall/build scripts are untrusted code, so remove it here and
-      # materialize it again only for the log push.
-      - name: Drop checkout credentials before running app code
-        run: |
-          set -euo pipefail
-          removed=0
-          while IFS= read -r key; do
-            rm -f "$key"
-            removed=$((removed + 1))
-          done < <(grep -l -- 'PRIVATE KEY' "$RUNNER_TEMP"/* 2>/dev/null || true)
-          echo "removed ${removed} key file(s) from RUNNER_TEMP"
-
-      # Manual runs hand over a desktop, not a build: the app lands in the home
-      # directory and the toolchain is ready, so the build happens graphically.
-      - name: Clone the app for graphical work
-        if: inputs.manual_minutes != '0'
-        timeout-minutes: 15
-        env:
-          APP_REPO: ${{ secrets.APP_REPO }}
-          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
-          APP_SHA: ${{ inputs.sha }}
-        run: |
-          set -euo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
-          mkdir -p "$LOGS"
-          DEST="$HOME/${APP_REPO#*/}"
-          rm -rf "$DEST"
-          if [[ -n "$APP_DEPLOY_KEY" ]]; then
-            KEY="$RUNNER_TEMP/clone_key"
-            trap 'rm -f "$KEY"' EXIT
-            printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
-            chmod 600 "$KEY"
-            GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/clone_known_hosts" \
-              git clone --quiet "git@github.com:${APP_REPO}.git" "$DEST" >> "$LOGS/clone.log" 2>&1 || true
-          fi
-          if [[ ! -d "$DEST/.git" ]]; then
-            echo "clone unavailable; copying the checked-out tree" >> "$LOGS/clone.log"
-            cp -R "$GITHUB_WORKSPACE/app" "$DEST"
-            git -C "$DEST" remote set-url origin "git@github.com:${APP_REPO}.git" 2>/dev/null || true
-          fi
-          git -C "$DEST" checkout --quiet "$APP_SHA" 2>/dev/null \
-            || echo "warning: could not check out ${APP_SHA:0:7}" >> "$LOGS/clone.log"
-          echo "APP_DIR=$DEST" >> "$GITHUB_ENV"
-          {
-            echo "cloned ${APP_REPO} into ${DEST}"
-            git -C "$DEST" log --oneline -1
-          } >> "$LOGS/clone.log" 2>&1
-          cat "$LOGS/clone.log"
-
-      - name: Prepare the desktop toolchain
-        if: inputs.manual_minutes != '0'
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
-          mkdir -p "$LOGS"
-          {
-            echo "== xcode"
-            xcodebuild -version
-            echo "== simulators"
-            xcrun simctl list devices available | head -5
-            echo "== node"
-            node --version
-            npm --version
-            echo "== yarn"
-            if ! command -v yarn >/dev/null 2>&1; then
-              npm install -g yarn >/dev/null 2>&1 || corepack enable
-            fi
-            yarn --version
-          } 2>&1 | tee "$LOGS/toolchain.log"
-
-      # Manual runs expose Screen Sharing (VNC) to the tester's private tailnet only.
-      # The repo's Actions policy allows only GitHub-owned actions, and Tailscale's
-      # macOS support builds from source, so the client comes from Homebrew instead: a
-      # bottle on both hosted macOS images (measured: ~8 s) with a system daemon that
-      # outlives this step. The node leaves the tailnet when the job ends; VNC is never
-      # published to the internet.
-      - name: Connect Tailscale
-        if: inputs.manual_minutes != '0'
+      # Tailscale first (it is the only network dependency), with the streamer compile
+      # running behind it. A failed compile is not fatal: the hold step falls back to a
+      # screencapture loop, and the self-test uses cliclick for input.
+      - name: Prepare the desktop
         timeout-minutes: 10
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           RUN_ID: ${{ github.run_id }}
+          SERVER_REPO: ${{ github.repository }}
+          SERVER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
+          LOGS="$RUNNER_TEMP/logs"
           mkdir -p "$LOGS"
-          LOG="$LOGS/tailscale-setup.log"
-          # Published with ci-logs: the public step log is deleted when the run ends, so
-          # a failed join would otherwise leave no reason behind.
-          step() { echo "+ $*" ; "$@" 2>&1 | tee -a "$LOG" ; }
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
 
-          if [[ -z "$TAILSCALE_AUTH_KEY" ]]; then
-            echo "TAILSCALE_AUTH_KEY is empty" | tee -a "$LOG"
+          STREAM="$RUNNER_TEMP/screen-stream"
+          COMPILE=""
+          if [[ -x "$STREAM" ]]; then
+            echo "screen streamer restored from the cache"
+          else
+            if curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/screen-stream.swift" \
+                -o "$RUNNER_TEMP/screen-stream.swift"; then
+              xcrun swiftc -O -swift-version 5 -o "$STREAM" \
+                "$RUNNER_TEMP/screen-stream.swift" > "$LOGS/swiftc.log" 2>&1 &
+              COMPILE=$!
+              echo "compiling the screen streamer in the background"
+            else
+              echo "warning: could not fetch bin/screen-stream.swift from ${SERVER_SHA:0:7}"
+            fi
+          fi
+
+          if [[ -z "${TAILSCALE_AUTH_KEY:-}" ]]; then
+            echo "TAILSCALE_AUTH_KEY is empty"
             exit 1
           fi
-          step brew install tailscale
-          TS_PREFIX=$(brew --prefix)
-          echo "$TS_PREFIX/bin" >> "$GITHUB_PATH"
-          step sudo "$TS_PREFIX/bin/tailscaled" install-system-daemon
+          # This repo's Actions policy allows only GitHub-owned actions and Tailscale's
+          # macOS support builds from source, so the client comes from Homebrew: a
+          # bottle on this image (measured ~8 s) with a system daemon that outlives
+          # this step.
+          if ! command -v tailscale >/dev/null 2>&1; then
+            brew install tailscale
+          fi
+          if ! command -v cliclick >/dev/null 2>&1; then
+            # Soft: the streamer injects input itself, cliclick is only the fallback
+            # used while it is unavailable.
+            brew install cliclick >/dev/null 2>&1 \
+              || echo "warning: cliclick is unavailable; input falls back to the streamer socket only"
+          fi
 
+          PREFIX=$(brew --prefix)
+          TS=$(command -v tailscale || true)
+          [[ -n "$TS" ]] || TS="$PREFIX/bin/tailscale"
+          if [[ ! -x "$TS" ]]; then
+            echo "tailscale is not installed at $TS"
+            exit 1
+          fi
+          echo "$(dirname "$TS")" >> "$GITHUB_PATH"
+          {
+            echo "TAILSCALE=$TS"
+            echo "STREAM=$STREAM"
+          } >> "$GITHUB_ENV"
+
+          sudo "$PREFIX/bin/tailscaled" install-system-daemon || true
           # install-system-daemon returns before the socket answers; `up` would fail
           # with "failed to connect to local tailscaled" if it ran immediately.
-          for i in $(seq 1 30); do
-            if "$TS_PREFIX/bin/tailscale" status --json 2>/dev/null | jq -e . >/dev/null 2>&1; then
-              echo "daemon ready after ${i}s" | tee -a "$LOG"
-              break
-            fi
-            sleep 1
+          for _ in $(seq 1 40); do
+            if "$TS" status --json 2>/dev/null | jq -e . >/dev/null 2>&1; then break; fi
+            sleep 0.5
           done
 
           # `up` has no --ephemeral flag: ephemerality is a property of the auth key.
-          if ! step sudo "$TS_PREFIX/bin/tailscale" up \
-            --authkey="$TAILSCALE_AUTH_KEY" \
-            --hostname="ios-ci-${RUN_ID}" \
-            --timeout=120s; then
-            if grep -q 'invalid key' "$LOG"; then
+          # The key is never echoed; the log holds the client's own error text.
+          UP_LOG="$LOGS/tailscale-up.log"
+          if ! "$TS" up --authkey="$TAILSCALE_AUTH_KEY" \
+              --hostname="ios-ci-${RUN_ID}" --timeout=120s > "$UP_LOG" 2>&1; then
+            tail -20 "$UP_LOG"
+            if grep -qi 'invalid key' "$UP_LOG"; then
               echo "TAILSCALE_AUTH_KEY was rejected: paste a reusable auth key (tskey-auth-…),"
               echo "not an OAuth client secret, from https://login.tailscale.com/admin/settings/keys"
-              # Identifies the credential type without revealing it: tskey-auth-… is an
-              # auth key, tskey-client-… an OAuth client secret, tskey-api-… an API token.
-              echo "stored value: ${#TAILSCALE_AUTH_KEY} chars, starts with '${TAILSCALE_AUTH_KEY:0:12}'" | tee -a "$LOG"
+              case "$TAILSCALE_AUTH_KEY" in
+                tskey-auth-*) echo "stored value is an auth key but was rejected: it may be expired, revoked, or already used" ;;
+                tskey-client-*) echo "stored value is an OAuth client secret (tskey-client-…): use a reusable auth key" ;;
+                tskey-api-*) echo "stored value is an API token (tskey-api-…): use a reusable auth key" ;;
+                *) echo "stored value is ${#TAILSCALE_AUTH_KEY} characters and does not start with tskey-" ;;
+              esac
             fi
             exit 1
           fi
-          "$TS_PREFIX/bin/tailscale" status 2>&1 | tee -a "$LOG" || true
+          "$TS" status 2>&1 | tail -5 || true
 
-      - name: Select Xcode
-        run: |
-          sudo xcode-select -s /Applications/Xcode_26.6.app
-          xcodebuild -version
-
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: ${{ inputs.node_version }}
-          cache: npm
-          cache-dependency-path: app/package-lock.json
-
-      - name: Install web dependencies
-        if: inputs.manual_minutes == '0'
-        working-directory: app
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          mkdir -p "$RUNNER_TEMP/ci-logs"
-          npm ci > "$RUNNER_TEMP/ci-logs/npm-ci.log" 2>&1 || {
-            echo "npm ci failed"
-            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/npm-ci.log"; fi
-            exit 1
-          }
-
-      - name: Build web assets
-        if: inputs.manual_minutes == '0'
-        working-directory: app
-        timeout-minutes: 15
-        run: |
-          set -euo pipefail
-          npm run build > "$RUNNER_TEMP/ci-logs/npm-build.log" 2>&1 || {
-            echo "web build failed"
-            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/npm-build.log"; fi
-            exit 1
-          }
-
-      - name: Sync Capacitor iOS project
-        if: inputs.manual_minutes == '0'
-        working-directory: app
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          if [[ ! -d ios/App ]]; then npx cap add ios; fi
-          npx cap sync ios > "$RUNNER_TEMP/ci-logs/cap-sync.log" 2>&1 || {
-            echo "cap sync failed"
-            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/cap-sync.log"; fi
-            exit 1
-          }
-
-      - name: Build for iOS Simulator
-        if: inputs.manual_minutes == '0'
-        working-directory: app
-        timeout-minutes: 20
-        run: |
-          set -euo pipefail
-          if [[ -d ios/App/App.xcworkspace ]]; then
-            PROJECT=(-workspace ios/App/App.xcworkspace)
-          else
-            PROJECT=(-project ios/App/App.xcodeproj)
-          fi
-          xcodebuild "${PROJECT[@]}" \
-            -scheme App \
-            -configuration Debug \
-            -sdk iphonesimulator \
-            -destination "generic/platform=iOS Simulator" \
-            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
-            CODE_SIGNING_ALLOWED=NO \
-            build > "$RUNNER_TEMP/ci-logs/xcodebuild.log" 2>&1 || {
-              echo "xcodebuild failed"
-              if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then cat "$RUNNER_TEMP/ci-logs/xcodebuild.log"; fi
-              exit 1
-            }
-
-      - name: Boot simulator and install app
-        if: inputs.manual_minutes == '0'
-        id: boot
-        working-directory: app
-        timeout-minutes: 10
-        run: |
-          set -euo pipefail
-          DEVICE=$(xcrun simctl list devices available -j | jq -r '
-            [.devices | to_entries[] | .key as $runtime | .value[]
-             | select(.name | test("^iPhone")) | {runtime: $runtime, name: .name, udid: .udid}]
-            | (map(select(.name == "iPhone 17")) | sort_by(.runtime) | last)
-              // (sort_by(.runtime) | last)
-            | "\(.name) \(.udid)"')
-          if [[ -z "$DEVICE" || "$DEVICE" == "null"* ]]; then
-            echo "no iPhone simulator found"
-            xcrun simctl list devices available | head -30
-            exit 1
-          fi
-          UDID=${DEVICE##* }
-          echo "simulator: ${DEVICE% *}"
-          {
-            echo "UDID=$UDID"
-            echo "SIMULATOR=${DEVICE% *}"
-          } >> "$GITHUB_ENV"
-          xcrun simctl boot "$UDID" 2>/dev/null || true
-          BOOTED=0
-          for _ in $(seq 1 270); do
-            if xcrun simctl list devices | grep -q "($UDID) (Booted)"; then BOOTED=1; break; fi
-            sleep 2
-          done
-          if [[ "$BOOTED" != "1" ]]; then
-            echo "simulator $UDID did not reach Booted within 540s"
-            xcrun simctl list devices available | head -30
-            exit 1
-          fi
-          APP_PATH=$(find "$RUNNER_TEMP/DerivedData/Build/Products/Debug-iphonesimulator" \
-            -maxdepth 1 -name 'App.app' | head -n1)
-          if [[ -z "$APP_PATH" ]]; then echo "built .app not found"; exit 1; fi
-          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
-          xcrun simctl install "$UDID" "$APP_PATH"
-          BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
-          echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
-
-      # Manual runs start from whatever the image ships. The tester's preferences
-      # (a different Xcode, a simulator with its runtime, brew packages, a setup
-      # script) are applied here, before the desktop opens, so the VM they get is the
-      # one they asked for. Every command here is best effort: a preference that
-      # cannot be satisfied must not cost the session, so failures are recorded in
-      # boot-config.log and reflected in BOOT_STATUS.
-      - name: Apply boot config
-        if: always() && inputs.manual_minutes != '0'
-        timeout-minutes: 25
-        env:
-          BOOT_CONFIG: ${{ inputs.boot_config }}
-        run: |
-          set -uo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
-          mkdir -p "$LOGS"
-          exec > >(tee -a "$LOGS/boot-config.log") 2>&1
-          BOOT_STATUS=ok
-          warn() { echo "warning: $*"; BOOT_STATUS=partial; }
-
-          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
-          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
-
-          BOOT_CONFIG="${BOOT_CONFIG:-}"
-          if [[ -z "${BOOT_CONFIG// /}" || "${BOOT_CONFIG// /}" == "{}" ]]; then
-            BOOT_CONFIG='{}'
-            echo "boot config: none"
-          elif ! printf '%s' "$BOOT_CONFIG" | jq -e . >/dev/null 2>&1; then
-            warn "boot_config is not valid JSON; using image defaults"
-            BOOT_CONFIG='{}'
-          else
-            echo "boot config: $BOOT_CONFIG"
-          fi
-
-          XCODE=$(printf '%s' "$BOOT_CONFIG" | jq -r '.xcode // empty')
-          if [[ -n "$XCODE" ]]; then
-            echo "== xcode: $XCODE"
-            ls -d /Applications/Xcode*.app 2>/dev/null || true
-            if [[ -d "$XCODE" ]]; then
-              sudo xcode-select -s "$XCODE" && xcodebuild -version \
-                || warn "could not select $XCODE"
+          if [[ -n "$COMPILE" ]]; then
+            set +e
+            wait "$COMPILE"
+            COMPILE_STATUS=$?
+            set -e
+            if [[ "$COMPILE_STATUS" != "0" || ! -x "$STREAM" ]]; then
+              tail -20 "$LOGS/swiftc.log" 2>/dev/null || true
+              echo "warning: could not build the screen streamer; using a screencapture loop"
+              rm -f "$STREAM"
             else
-              warn "$XCODE is not installed on this image"
+              echo "screen streamer built: $STREAM"
             fi
+          elif [[ ! -x "$STREAM" ]]; then
+            echo "warning: no screen streamer; using a screencapture loop"
           fi
 
-          PLATFORM=$(printf '%s' "$BOOT_CONFIG" | jq -r '.simulator.platform // empty')
-          if [[ -n "$PLATFORM" ]]; then
-            echo "== simulator platform: $PLATFORM"
-            if [[ "$PLATFORM" == "latest" ]]; then
-              xcodebuild -downloadPlatform iOS || warn "downloading the iOS platform failed"
-            else
-              xcodebuild -downloadPlatform iOS -buildVersion "$PLATFORM" \
-                || warn "downloading iOS platform $PLATFORM failed"
-            fi
-            xcrun simctl list runtimes | tail -5 || true
-          fi
-
-          DEVICE=$(printf '%s' "$BOOT_CONFIG" | jq -r '.simulator.device // empty')
-          RUNTIME=$(printf '%s' "$BOOT_CONFIG" | jq -r '.simulator.runtime // empty')
-          if [[ -n "$DEVICE" ]]; then
-            echo "== simulator: $DEVICE (runtime: ${RUNTIME:-any})"
-            UDID=$(xcrun simctl list devices available -j | jq -r \
-              --arg d "$DEVICE" --arg r "$RUNTIME" '
-                [.devices | to_entries[] | .key as $runtime | .value[]
-                 | select(.name == $d)
-                 | select(($r | length) == 0
-                     or (($runtime | ascii_downcase)
-                         | contains($r | ascii_downcase))
-                     or (($runtime | ascii_downcase)
-                         | contains($r | gsub("\\."; "-") | ascii_downcase)))
-                 | {runtime: $runtime, udid: .udid}]
-                | sort_by(.runtime) | last | .udid // empty')
-            if [[ -z "$UDID" ]]; then
-              warn "no available simulator named '$DEVICE'; the image's own choice stays"
-              xcrun simctl list devices available | head -30 || true
-            else
-              echo "booting $DEVICE ($UDID)"
-              xcrun simctl boot "$UDID" 2>/dev/null || true
-              BOOTED=0
-              for _ in $(seq 1 150); do
-                if xcrun simctl list devices | grep -q "($UDID) (Booted)"; then BOOTED=1; break; fi
-                sleep 2
-              done
-              if [[ "$BOOTED" == "1" ]]; then
-                SIMULATOR="$DEVICE"
-                {
-                  echo "SIMULATOR=$DEVICE"
-                  echo "UDID=$UDID"
-                } >> "$GITHUB_ENV"
-                # The Simulator window belongs to the console session, not this shell.
-                sudo launchctl asuser "$CONSOLE_UID" open -a Simulator 2>/dev/null \
-                  || open -a Simulator || warn "could not open the Simulator app"
-              else
-                warn "simulator $UDID did not reach Booted within 300 s"
-              fi
-            fi
-          fi
-
-          for formula in $(printf '%s' "$BOOT_CONFIG" | jq -r '(.brew // [])[]?'); do
-            [[ -n "$formula" ]] || continue
-            echo "== brew install $formula"
-            brew install "$formula" || warn "brew install $formula failed"
-          done
-
-          SETUP_SCRIPT=$(printf '%s' "$BOOT_CONFIG" | jq -r '.script // empty')
-          if [[ -n "$SETUP_SCRIPT" ]]; then
-            echo "== setup script ($(printf '%s\n' "$SETUP_SCRIPT" | wc -l | tr -d ' ') lines)"
-            printf '%s\n' "$SETUP_SCRIPT" > "$RUNNER_TEMP/boot-setup.sh"
-            # APP_DIR points at the cloned app; the script's output lands in this log.
-            bash "$RUNNER_TEMP/boot-setup.sh" || warn "the setup script exited non-zero"
-            echo "== setup script finished"
-          fi
-
-          echo "BOOT_STATUS=$BOOT_STATUS" >> "$GITHUB_ENV"
-          echo "boot config applied: $BOOT_STATUS"
-
-      # Manual runs: enable the built-in Screen Sharing server, join the tailnet (the
-      # step above), and publish the tailnet address to the private app repo. Runs even
-      # when the build or smoke test failed so the tester can inspect the desktop. The
-      # deploy key is materialized only here, after all app code has run, and removed
-      # before the hold; the final publish step materializes it again.
-      #
-      # The server accepts only Apple authentication (RFB 30/33/35/36), so the tester
-      # signs in as the `tester` account created here; clients must support Apple
-      # Screen Sharing auth (macOS Screen Sharing, RealVNC, Jump). Remmina, TigerVNC
-      # and other plain-VNC clients cannot authenticate to macOS 26.
+      # This step is the session: it opens the desktop, proves frames and input work,
+      # and then holds the VM for the requested minutes. Captures run from this shell
+      # because it carries the image's screen-recording grant: the console session is a
+      # different TCC responsibility chain, and a capture there raises a modal consent
+      # dialog that swallows every click.
       - name: Open the desktop
-        if: always() && inputs.manual_minutes != '0'
-        timeout-minutes: 10
+        timeout-minutes: 310
         env:
           RUN_ID: ${{ github.run_id }}
-          APP_REPO: ${{ secrets.APP_REPO }}
-          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
-          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
-          SERVER_SHA: ${{ github.sha }}
           SERVER_REPO: ${{ github.repository }}
+          SERVER_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
+          LOGS="$RUNNER_TEMP/logs"
           mkdir -p "$LOGS"
-          exec > >(tee -a "$LOGS/vnc-step.log") 2>&1
+          exec > >(tee -a "$LOGS/desktop-step.log") 2>&1
 
-          # Screen Sharing cannot be used here: on macOS 26 its agent dies with
-          # "Unable to capture screen" because the capture permission is gated behind
-          # managed (MDM) preferences, and a client therefore receives a black frame.
-          # `screencapture` and "System Events" both work in the console session, so
-          # the desk is served as PNG frames with clicks and keys injected instead.
+          TAILSCALE="${TAILSCALE:-}"
+          if [[ ! -x "$TAILSCALE" ]]; then
+            echo "tailscale is not available; 'Prepare the desktop' did not finish"
+            exit 1
+          fi
+          STREAM="${STREAM:-$RUNNER_TEMP/screen-stream}"
+
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
           caffeinate -u -t 2 || true
           CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
@@ -508,31 +210,19 @@ jobs:
           [[ -n "$CONSOLE_HOME" ]] || CONSOLE_HOME="/Users/${CONSOLE_USER}"
           echo "console user: ${CONSOLE_USER} (${CONSOLE_HOME})"
 
-          # Evidence that the desk exists, published with the address.
-          screencapture -x "$LOGS/desktop.png" 2>&1 || true
+          FRAME=/tmp/desktop-frame.jpg
+          # A frame left by the image (or a previous step) would make /stats claim a
+          # picture that nobody is producing; the flags below are this run's verdicts.
+          rm -f "$FRAME" "$FRAME.beat" "$FRAME.stat" "$FRAME.tmp" \
+                /tmp/desktop-input-ok /tmp/desktop-input-checked
 
           # Input needs real CGEvents: System Events' position clicks are no-ops.
-          brew install cliclick 2>&1 | tail -2 || true
           CLICLICK=$(command -v cliclick || echo /opt/homebrew/bin/cliclick)
           echo "cliclick: ${CLICLICK}"
 
-          # `screencapture` costs ~0.15 s per call and caps a capture loop near 6 fps.
-          # This streams compositor frames instead (45-55 fps measured on this image).
-          # Built from the running commit so the binary matches the server, and built
-          # here because the hold step needs it already present. A failure is not fatal:
-          # the hold step falls back to the screencapture loop.
-          STREAM="$RUNNER_TEMP/screen-stream"
-          if curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/screen-stream.swift" \
-              -o "$RUNNER_TEMP/screen-stream.swift"; then
-            if ! xcrun swiftc -O -swift-version 5 -o "$STREAM" "$RUNNER_TEMP/screen-stream.swift" 2>&1 | tail -20; then
-              echo "error: could not build the screen streamer; the desktop would fall back to a 5 fps capture loop"
-              exit 1
-            fi
-            echo "streamer built: ${STREAM}"
-          fi
-          # Accessibility and capture for the injected events, in BOTH databases: the
-          # console session consults its own user database, and a grant only in the
-          # system one leaves events dropped after the consent prompt times out.
+          # Accessibility and capture grants, in BOTH databases: the console session
+          # consults its own user database, and a grant only in the system one leaves
+          # events dropped after the consent prompt times out.
           USER_TCC="/Users/${CONSOLE_USER}/Library/Application Support/com.apple.TCC/TCC.db"
           for db in "/Library/Application Support/com.apple.TCC/TCC.db" "$USER_TCC"; do
             for client in "/usr/bin/python3" "$CLICLICK" "/bin/bash" "/usr/bin/osascript" "$STREAM"; do
@@ -543,308 +233,47 @@ jobs:
           done
           sudo killall tccd 2>/dev/null || true
           sleep 1
-          "$CLICLICK" m:520,520 2>&1 | head -2
-          echo "pointer: $(sudo launchctl asuser "$CONSOLE_UID" "$CLICLICK" p 2>&1 | head -1)"
 
           curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/desktop-server.py" \
             -o "$RUNNER_TEMP/desktop-server.py"
-          TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
-          TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
-          TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          TS_IP=$("$TAILSCALE" ip -4 2>/dev/null | head -1 || true)
+          TS_DNS=$("$TAILSCALE" status --json 2>/dev/null | jq -r '.Self.DNSName // empty' \
+            | sed 's/\.$//' || true)
           if [[ -z "$TS_IP" && -z "$TS_DNS" ]]; then
             echo "could not determine the Tailscale address"
-            tailscale status || true
+            "$TAILSCALE" status || true
             exit 1
           fi
           HOST="${TS_IP:-$TS_DNS}"
-          PORT=6080
-          # Capture from this shell: it already holds the screen-recording grant, so the
-          # frame stream never triggers the modal consent prompt that freezes input.
-          rm -f /tmp/desktop-frame.png
-          # Root captures outside the per-user consent path. Capturing as the console
-          # user makes macOS ask for persistent screen access with a modal dialog that
-          # ignores synthetic clicks, which freezes every later click and key.
-          # Capture from this shell, not through `launchctl asuser`: the console
-          # session is a different TCC responsibility chain without the image's
-          # screen-capture grant, and that is what raises the modal prompt
-          # ("bash is requesting to bypass the system private window picker") that
-          # then swallows every click. Measured: the same shell captures silently.
-          # Frames are captured by the hold step, which lives for the whole session:
-          # only this job's own shell carries the image's screen-capture grant. A
-          # background job here or under launchd/asuser is a different TCC chain and
-          # raises a modal consent dialog that blocks every click.
-          rm -f /tmp/desktop-frame.png
-          for _ in $(seq 1 20); do
-            [[ -s /tmp/desktop-frame.png ]] && break
-            sleep 1
-          done
-          # IOS_CI_UPLOAD_HOME: `launchctl asuser` keeps the uid (root), so the
-          # server cannot derive the tester's home from its own credentials.
-          sudo launchctl asuser "$CONSOLE_UID" /bin/bash -c \
-            "IOS_CI_UPLOAD_HOME='$CONSOLE_HOME' nohup /usr/bin/python3 '$RUNNER_TEMP/desktop-server.py' 6080 '$TOKEN' '$HOST' > '$LOGS/desktop-server.log' 2>&1 &"
-          sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
-            -e 'tell application "System Events" to get name of first process' >/dev/null 2>&1 || true
-          caffeinate -d -i -m -s -u -t 7200 &
+          echo "tailnet address: ${HOST}"
 
-          for _ in $(seq 1 30); do
+          # IOS_CI_UPLOAD_HOME: `launchctl asuser` keeps the uid (root), so the server
+          # cannot derive the tester's home from its own credentials.
+          sudo launchctl asuser "$CONSOLE_UID" /bin/bash -c \
+            "IOS_CI_UPLOAD_HOME='$CONSOLE_HOME' nohup /usr/bin/python3 '$RUNNER_TEMP/desktop-server.py' 6080 '$SESSION_TOKEN_HASH' '$HOST' > '$LOGS/desktop-server.log' 2>&1 &"
+          for _ in $(seq 1 40); do
             sudo lsof -iTCP:6080 -sTCP:LISTEN >/dev/null 2>&1 && break
-            sleep 1
+            sleep 0.25
           done
           if ! sudo lsof -iTCP:6080 -sTCP:LISTEN >/dev/null 2>&1; then
             echo "the desktop server is not listening on 6080"
             cat "$LOGS/desktop-server.log" 2>/dev/null || true
             exit 1
           fi
-          echo "desktop server listening"
-          # Prove input works before publishing: a click on the Apple menu must change
-          # the screen, and Escape must undo it. Both captures run in this step's own
-          # chain, which is the one carrying the grant.
-          screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null || true
-          chmod 644 /tmp/desktop-frame.png 2>/dev/null || true
-          echo "frame bytes: $(stat -f%z /tmp/desktop-frame.png 2>/dev/null || echo 0)"
-          BEFORE=$(shasum /tmp/desktop-frame.png 2>/dev/null | cut -d' ' -f1)
-          curl -s -m 15 "http://${HOST}:${PORT}/click?fx=0.02&fy=0.02&t=${TOKEN}" >/dev/null || true
-          sleep 2
-          screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null || true
-          AFTER=$(shasum /tmp/desktop-frame.png 2>/dev/null | cut -d' ' -f1)
-          curl -s -m 15 "http://${HOST}:${PORT}/key?name=Escape&t=${TOKEN}" >/dev/null || true
-          if [[ -z "$BEFORE" || "$BEFORE" == "$AFTER" ]]; then
-            echo "input self-test: NO CHANGE (clicks are not landing)"
-          else
-            echo "input self-test: click changed the screen"
-          fi
+          echo "desktop server listening on ${HOST}:6080"
 
-          DESKTOP_URL="http://${HOST}:${PORT}/?t=${TOKEN}"
-          {
-            echo "run_id: ${RUN_ID}"
-            echo "repo: ${APP_DIR:-}"
-            echo "desktop_url: ${DESKTOP_URL}"
-            echo "session_minutes: ${MANUAL_MINUTES}"
-            echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            echo "boot_status: ${BOOT_STATUS:-unknown}"
-            echo "simulator: ${SIMULATOR:-none}"
-            echo "xcode: $(xcode-select -p 2>/dev/null || echo none)"
-            echo "node: $(node --version 2>/dev/null || echo none)"
-            echo "yarn: $(yarn --version 2>/dev/null || echo none)"
-          } > "$LOGS/manual-ready.txt"
-
-          KEY="$RUNNER_TEMP/manual_key"
-          trap 'rm -f "$KEY"' EXIT
-          printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
-          chmod 600 "$KEY"
-          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/manual_known_hosts"
-          REMOTE="git@github.com:${APP_REPO}.git"
-          TMP="$RUNNER_TEMP/manual-publish"
-          rm -rf "$TMP"
-          mkdir -p "$TMP"
-          git -C "$TMP" init -q
-          git -C "$TMP" config user.name ios-ci
-          git -C "$TMP" config user.email ios-ci@users.noreply.github.com
-
-          # Publish on top of the current ci-logs branch instead of force-pushing a
-          # single commit, so a concurrent manual session keeps its
-          # ci-logs/sessions/<run_id>/ address. The shared ci-logs/manual-ready.txt
-          # still points at the newest session, which is what bin/ios-ci.sh reads.
-          publish_ready() {
-            if git -C "$TMP" fetch -q "$REMOTE" ci-logs 2>/dev/null; then
-              git -C "$TMP" reset -q --hard FETCH_HEAD
-            fi
-            mkdir -p "$TMP/ci-logs/sessions/${RUN_ID}"
-            cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
-            cp "$LOGS/vnc-step.log" "$TMP/ci-logs/vnc-step.log"
-            cp "$LOGS"/desktop.png "$TMP/ci-logs/" 2>/dev/null || true
-            cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/sessions/${RUN_ID}/manual-ready.txt"
-            cp "$LOGS/boot-config.log" "$TMP/ci-logs/sessions/${RUN_ID}/" 2>/dev/null || true
-            cp "$LOGS"/desktop.png "$TMP/ci-logs/sessions/${RUN_ID}/" 2>/dev/null || true
-            git -C "$TMP" add ci-logs
-            git -C "$TMP" diff --cached --quiet && return 0
-            git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
-            git -C "$TMP" push -q "$REMOTE" HEAD:refs/heads/ci-logs
-          }
-          pushed=0
-          for attempt in 1 2 3; do
-            if publish_ready; then pushed=1; break; fi
-            echo "publish attempt ${attempt} lost a race with another session; retrying"
-            sleep 2
-          done
-          if [[ "$pushed" != "1" ]]; then
-            echo "warning: could not fast-forward ci-logs; forcing the session address"
-            git -C "$TMP" push -q --force "$REMOTE" HEAD:refs/heads/ci-logs
-          fi
-          echo "DESKTOP_READY=1" >> "$GITHUB_ENV"
-          echo "DESKTOP_URL=${DESKTOP_URL}" >> "$GITHUB_ENV"
-          echo "desktop ready; url published to the private ci-logs branch"
-
-      - name: Install Maestro
-        if: always() && inputs.manual_minutes == '0' && steps.boot.outcome == 'success'
-        timeout-minutes: 5
-        env:
-          MAESTRO_VERSION: 2.12.1
-        run: |
-          curl -fsSL "https://get.maestro.mobile.dev" | bash
-          echo "$HOME/.maestro/bin" >> "$GITHUB_PATH"
-
-      # Measured on macos-26 + Xcode 26.6, first XCTest driver start on a fresh simulator,
-      # time from `xcodebuild test-without-building` to a live runner: 254 s, 330 s (the run
-      # that failed at 300 s), 451 s. The spread is wide and the tail matters, so the first
-      # attempt gets 600 s; a warm second start takes 21 s. A driver that still
-      # never opens its port is an environment failure, not a product failure, so retry
-      # that signature once. Assertion failures fail immediately and are never retried.
-      #
-      # A timed-out attempt leaves its `xcodebuild` running, and it relaunches the runner
-      # on its own ("Restarting after unexpected exit, crash, or test timeout"). Observed:
-      # attempt 1 respawned a runner at 18:51:59 while attempt 2 was serving requests, and
-      # attempt 2's runner died with `ConnectException` on its port. Two XCTest sessions on
-      # one simulator kill each other, so reap them between attempts. Worst case is
-      # 600 + 300 s, and the 20-minute step cap still holds.
-      - name: Run Maestro smoke test
-        # The desktop is enabled before this step, so the tester can watch the flow and
-        # the smoke result must survive a desktop failure; it is still skipped when the
-        # simulator never booted.
-        if: always() && inputs.manual_minutes == '0' && steps.boot.outcome == 'success'
-        working-directory: app
-        timeout-minutes: 20
-        env:
-          SMOKE_TEXT: ${{ inputs.smoke_text }}
-          MAESTRO_CLI_NO_ANALYTICS: "1"
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.maestro/bin:$PATH"
-          LOGS="$RUNNER_TEMP/ci-logs"
-          ART="$RUNNER_TEMP/ci-artifacts"
-          mkdir -p "$LOGS" "$ART"
-          DRIVER_FAILURE='iOS driver not ready in time|IOSDriverTimeoutException|Failed to connect to'
-          # The CLI's own debug log (~/.maestro/**/maestro.log) holds the driver's
-          # xcodebuild output, which is the only place a stalled driver start explains
-          # itself. Keep the three most recent, capped per file.
-          capture_maestro_logs() {
-            local attempt="$1" i=0 f files
-            files=$(find "$HOME/.maestro" -name maestro.log -type f 2>/dev/null | head -n 50 || true)
-            [[ -n "$files" ]] || return 0
-            while IFS= read -r f; do
-              i=$((i + 1))
-              tail -c 2000000 "$f" > "$LOGS/maestro-cli-${attempt}-${i}.log" 2>/dev/null || true
-            done < <(printf '%s\n' "$files" | xargs ls -t 2>/dev/null | head -n 3)
-            echo "captured ${i} Maestro CLI log(s) for attempt ${attempt}"
-          }
-          kill_stale_xctest() {
-            local pids
-            pids=$(pgrep -f 'maestro-driver-iosUITests' 2>/dev/null || true)
-            if [[ -z "$pids" ]]; then
-              echo "no stale xctest processes"
-              return 0
-            fi
-            echo "killing stale xctest processes: $(echo "$pids" | tr '\n' ' ')"
-            # shellcheck disable=SC2086
-            kill -9 $pids 2>/dev/null || true
-            sleep 2
-            echo "remaining: $(pgrep -f 'maestro-driver-iosUITests' 2>/dev/null | tr '\n' ' ')"
-          }
-          for attempt in 1 2; do
-            echo "Maestro attempt ${attempt}/2"
-            # bash 3.2 (macOS /bin/bash) treats an empty array as unset under set -u,
-            # so optional arguments are plain variables expanded only when set.
-            driver_flag=""
-            driver_timeout=600000
-            if [[ "$attempt" -gt 1 ]]; then
-              driver_flag="--reinstall-driver"
-              driver_timeout=300000
-            fi
-            if MAESTRO_DRIVER_STARTUP_TIMEOUT="$driver_timeout" \
-              maestro --device="$UDID" test \
-              -e APP_ID="$BUNDLE_ID" \
-              -e SMOKE_TEXT="$SMOKE_TEXT" \
-              --no-ansi \
-              --format junit \
-              --output "$LOGS/maestro-${attempt}.xml" \
-              --test-output-dir "$ART/attempt-${attempt}" \
-              --debug-output "$ART/debug-${attempt}" \
-              --flatten-debug-output \
-              ${driver_flag:+"$driver_flag"} \
-              .maestro/ > "$LOGS/maestro-${attempt}.log" 2>&1; then
-              capture_maestro_logs "$attempt"
-              cp "$LOGS/maestro-${attempt}.log" "$LOGS/maestro.log"
-              if [[ -f "$LOGS/maestro-${attempt}.xml" ]]; then
-                cp "$LOGS/maestro-${attempt}.xml" "$LOGS/maestro.xml"
-              fi
-              kill_stale_xctest
-              exit 0
-            fi
-            capture_maestro_logs "$attempt"
-            cp "$LOGS/maestro-${attempt}.log" "$LOGS/maestro.log"
-            if [[ "$attempt" -eq 1 ]] && grep -qE "$DRIVER_FAILURE" "$LOGS/maestro-${attempt}.log"; then
-              echo "Maestro iOS driver did not start; reaping and retrying once"
-              kill_stale_xctest
-              continue
-            fi
-            echo "Maestro smoke test failed"
-            if [[ "${DEBUG_PUBLIC_LOGS}" == "true" ]]; then
-              tail -n 200 "$LOGS/maestro-${attempt}.log"
-              cat "$LOGS/maestro-${attempt}.xml" 2>/dev/null || true
-            fi
-            kill_stale_xctest
-            exit 1
-          done
-          echo "Maestro smoke test did not run"
-          exit 1
-
-      - name: Manual test session
-        if: always() && inputs.manual_minutes != '0'
-        timeout-minutes: ${{ fromJSON(needs.plan.outputs.hold_timeout) }}
-        env:
-          MANUAL_MINUTES: ${{ inputs.manual_minutes }}
-          RUN_ID: ${{ github.run_id }}
-          APP_REPO: ${{ secrets.APP_REPO }}
-          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
-        run: |
-          set -euo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
-          mkdir -p "$LOGS"
-          if [[ "${DESKTOP_READY:-0}" != "1" ]]; then
-            echo "the desktop was not enabled; skipping the manual hold"
-            exit 0
-          fi
-          caffeinate -u -t 1 || true
-          # Capture for the whole hold: only this job's own shell carries the image's
-          # screen-capture grant, and a job started from a step dies with that step.
-          FRAME=/tmp/desktop-frame.jpg
-          rm -f /tmp/desktop-frame.png "$FRAME" "$FRAME.tmp"
-          # The assertion has to live in the console session: started from this step it
-          # does not stop the display from blanking, and `screencapture` then blocks on
-          # the sleeping display (frames minutes apart).
-          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
-          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
-          sudo launchctl asuser "$CONSOLE_UID" /usr/bin/caffeinate -d -i -m -s -u \
-            -t $(( 10#${MANUAL_MINUTES} * 60 + 600 )) 2>/dev/null &
-          # The desktop is the deliverable: open the tools the tester needs and give the
-          # session a moment to come up before the first connection lands.
-          # Only Finder: launching Xcode or the Simulator here saturates the 4-core VM
-          # and makes screencapture block for a minute at a time; the tester opens them
-          # from the desktop when needed.
-          if [[ -n "${APP_DIR:-}" ]]; then
-            open "$APP_DIR" 2>/dev/null || true
-          fi
-          {
-            echo "started: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-            echo "repo: ${APP_DIR:-none}"
-            echo "duration: ${MANUAL_MINUTES} minutes"
-          } > "$LOGS/manual-session.txt"
-          echo "Manual session open for ${MANUAL_MINUTES} minutes; build ${APP_DIR:-the app} in Xcode."
-          caffeinate -d -i -m -s -u -t $(( 10#${MANUAL_MINUTES} * 60 + 300 )) &
-          # ScreenCaptureKit streams compositor frames to FRAME; it has to start from
-          # this step's shell for the same reason the capture below does (the console
-          # session is a different TCC chain without the image's grant).
-          STREAM="$RUNNER_TEMP/screen-stream"
+          # Start it if there is one, and take one frame either way: /stats counts
+          # frames, and the page paints from the file.
           STREAM_PID=""
           if [[ -x "$STREAM" ]]; then
             "$STREAM" "$FRAME" 60 0.45 960 >/dev/null 2>"$LOGS/screen-stream.log" &
             STREAM_PID=$!
-            for _ in $(seq 1 20); do
-              sleep 0.5
+            for _ in $(seq 1 40); do
               [[ -s "$FRAME" ]] && break
+              sleep 0.25
             done
             if [[ ! -s "$FRAME" ]]; then
-              echo "the screen streamer produced no frame; falling back to screencapture"
+              echo "the screen streamer produced no frame; using screencapture for the session"
               kill "$STREAM_PID" 2>/dev/null || true
               wait "$STREAM_PID" 2>/dev/null || true
               STREAM_PID=""
@@ -853,7 +282,52 @@ jobs:
               echo "screen stream: $(head -1 "$LOGS/screen-stream.log" 2>/dev/null)"
             fi
           fi
-          END=$(( $(date +%s) + 10#${MANUAL_MINUTES} * 60 ))
+          if [[ -z "$STREAM_PID" ]]; then
+            screencapture -x -t jpg "$FRAME.tmp" 2>/dev/null \
+              && mv -f "$FRAME.tmp" "$FRAME" 2>/dev/null || true
+          fi
+
+          # Self-test, once: a click near the Apple menu must repaint the screen. The
+          # after-shot is taken BEFORE Escape closes the menu again, or the diff would
+          # cancel itself out. Escape still runs, so the desktop is left as it was.
+          BEFORE_PNG="$RUNNER_TEMP/input-before.png"
+          AFTER_PNG="$RUNNER_TEMP/input-after.png"
+          screencapture -x -t png "$BEFORE_PNG" 2>/dev/null || true
+          USED_SOCKET=0
+          if [[ -n "$STREAM_PID" ]] && exec 3<>/dev/tcp/127.0.0.1/7777 2>/dev/null; then
+            printf '%s\n' '{"t":"mouse","type":"down","x":20,"y":20}' \
+                          '{"t":"mouse","type":"up","x":20,"y":20}' >&3
+            USED_SOCKET=1
+          elif [[ -x "$CLICLICK" ]]; then
+            "$CLICLICK" c:20,20 || true
+          fi
+          sleep 0.6
+          screencapture -x -t png "$AFTER_PNG" 2>/dev/null || true
+          BEFORE=$(shasum -a 256 "$BEFORE_PNG" 2>/dev/null | awk '{print $1}')
+          AFTER=$(shasum -a 256 "$AFTER_PNG" 2>/dev/null | awk '{print $1}')
+          touch /tmp/desktop-input-checked
+          if [[ -n "$BEFORE" && "$BEFORE" != "$AFTER" ]]; then
+            touch /tmp/desktop-input-ok
+            echo "input self-test: the click changed the screen"
+          else
+            echo "input self-test: NO CHANGE (clicks are not landing)"
+          fi
+          if [[ "$USED_SOCKET" == "1" ]]; then
+            printf '%s\n' '{"t":"key","code":53}' >&3
+            exec 3>&-
+          else
+            osascript -e 'tell application "System Events" to key code 53' >/dev/null 2>&1 || true
+          fi
+
+          # The advertised minutes start now, not at dispatch: the tester's clock
+          # begins when the desktop is usable.
+          END=$(( $(date +%s) + 10#${SESSION_MINUTES} * 60 ))
+          echo "desktop ready; holding ${SESSION_MINUTES} minutes"
+          # The assertion has to live in the console session: started from here it does
+          # not stop the display from blanking, and `screencapture` then blocks on the
+          # sleeping display (frames minutes apart).
+          sudo launchctl asuser "$CONSOLE_UID" /usr/bin/caffeinate -d -i -m -s -u \
+            -t $(( 10#${SESSION_MINUTES} * 60 + 600 )) 2>/dev/null &
           set +e                       # a dead streamer must not end the hold
           if [[ -n "$STREAM_PID" ]]; then
             while (( $(date +%s) < END )) && kill -0 "$STREAM_PID" 2>/dev/null; do
@@ -866,181 +340,22 @@ jobs:
           fi
           # Fallback capture in the foreground: a loop inside a background subshell is
           # napped to about one frame a second, while the same loop from the step's own
-          # shell runs at the capture cost (~4 fps). Skipped when the streamer held the
-          # whole session, because the deadline has already passed.
+          # shell runs at the capture cost (~4 fps). The beat keeps /stats.alive true.
           while (( $(date +%s) < END )); do
             screencapture -x -t jpg "$FRAME.tmp" 2>/dev/null \
               && mv -f "$FRAME.tmp" "$FRAME" 2>/dev/null
+            : > "$FRAME.beat"
             sleep 0.03
           done
           set -e
-          echo "ended: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$LOGS/manual-session.txt"
+          echo "session ended: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 
-      # The public run's logs are deleted by cleanup.yml as soon as the job ends, so a
-      # failed manual step would leave nothing behind. Record the state that decides
-      # whether the desktop was usable into ci-logs, which is published below.
-      - name: Manual diagnostics
-        if: always() && inputs.manual_minutes != '0'
-        env:
-          RUN_ID: ${{ github.run_id }}
+      - name: Clean up
+        if: always()
         run: |
           set +e
-          LOGS="$RUNNER_TEMP/ci-logs"
-          mkdir -p "$LOGS"
-          TS=$(brew --prefix 2>/dev/null)/bin/tailscale
-          {
-            echo "run_id: ${RUN_ID:-unknown}"
-            echo "console_user: $(stat -f%Su /dev/console 2>&1)"
-            echo
-            echo "== tailscale"
-            if [[ -x "$TS" ]]; then "$TS" status 2>&1 | head -30; else echo "not installed"; fi
-            echo
-            echo "== listeners"
-            sudo lsof -iTCP -sTCP:LISTEN 2>&1 | grep -E '6080|rfb' | head -5
-            echo
-            echo "== screen stream"
-            tail -10 "$LOGS/screen-stream.log" 2>&1
-            echo
-            echo "== desktop server log"
-            tail -20 "$LOGS/desktop-server.log" 2>&1
-            echo
-            echo "== frame"
-            ls -l /tmp/desktop-frame.jpg /tmp/desktop-frame.jpg.tmp 2>&1
-          } > "$LOGS/manual-diagnostics.txt" 2>&1
-          true
-
-      - name: Clean up manual session
-        if: always() && inputs.manual_minutes != '0'
-        run: |
-          set +e
-          if [[ -n "${UDID:-}" ]]; then xcrun simctl shutdown "$UDID" 2>/dev/null; fi
-          killall Simulator 2>/dev/null
-          killall Xcode 2>/dev/null
           # Drop the node from the tailnet now instead of waiting for the ephemeral key
           # to expire; the VM is destroyed with the job either way.
-          TS=$(brew --prefix 2>/dev/null)/bin/tailscale
-          if [[ -x "$TS" ]]; then sudo "$TS" logout 2>/dev/null; fi
+          TS=${TAILSCALE:-$(brew --prefix)/bin/tailscale}
+          [[ -x "$TS" ]] && sudo "$TS" logout
           true
-
-      - name: Publish logs to private repo
-        if: always()
-        env:
-          RUN_ID: ${{ github.run_id }}
-          CORRELATION: ${{ inputs.correlation_id }}
-          APP_SHA: ${{ inputs.sha }}
-          APP_REF: ${{ inputs.ref }}
-          APP_REPO: ${{ secrets.APP_REPO }}
-          APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
-        run: |
-          set -uo pipefail
-          LOGS="$RUNNER_TEMP/ci-logs"
-          ART="$RUNNER_TEMP/ci-artifacts"
-          [[ -d "$LOGS" ]] || { echo "no logs to publish"; exit 0; }
-          [[ -d app ]] || { echo "warning: app checkout missing; nothing to publish"; exit 0; }
-          [[ -n "${APP_DEPLOY_KEY:-}" ]] || { echo "warning: APP_DEPLOY_KEY is not set"; exit 0; }
-
-          # The deploy key is materialized only here: the build steps run app code and
-          # must not be able to reach a key that can write this repository.
-          KEY="$RUNNER_TEMP/publish_key"
-          trap 'rm -f "$KEY"' EXIT
-          printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
-          chmod 600 "$KEY"
-          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/publish_known_hosts"
-
-          {
-            echo "run_id: ${RUN_ID}"
-            echo "correlation_id: ${CORRELATION}"
-            echo "app_repo: ${APP_REPO}"
-            echo "app_sha: ${APP_SHA}"
-            echo "app_ref: ${APP_REF}"
-            echo "xcode: $(xcodebuild -version | tr '\n' ' ')"
-            echo "simulator: ${SIMULATOR:-unknown}"
-            echo "bundle_id: ${BUNDLE_ID:-unknown}"
-            echo "manual_minutes: ${MANUAL_MINUTES:-0}"
-            echo "maestro_attempts: $(ls "$LOGS"/maestro-*.log 2>/dev/null | wc -l | tr -d ' ')"
-          } > "$LOGS/summary.txt" 2>/dev/null || true
-
-          # Maestro's per-flow bundle can be large: one run published a 33 MB
-          # device-simulator.log. This branch is force-pushed every run, so text logs
-          # keep only their tail (where failures are). Screenshots and recordings are
-          # never truncated: a cut PNG or MP4 is corrupt, and they are the only way to
-          # see a headless run.
-          mkdir -p "$LOGS/maestro"
-          if [[ -d "$ART" ]]; then
-            cp -R "$ART"/. "$LOGS/maestro"/ 2>/dev/null || true
-            find "$LOGS/maestro" -type f -size +2000k \
-                 ! -name '*.png' ! -name '*.jpg' ! -name '*.mp4' ! -name '*.mov' 2>/dev/null \
-              | while IFS= read -r f; do
-                  tail -c 2000000 "$f" > "$f.capped" 2>/dev/null && mv "$f.capped" "$f"
-                  echo "capped $(basename "$f") to its last 2 MB"
-                done
-            find "$LOGS/maestro" -type f \( -name '*.png' -o -name '*.jpg' -o -name '*.mp4' -o -name '*.mov' \) \
-              -exec ls -l {} \; 2>/dev/null | while IFS= read -r line; do
-                echo "media: $(echo "$line" | awk '{print $5" bytes  "$9}')"
-              done
-          fi
-
-          cd app || exit 0
-          git config user.name "ios-ci"
-          git config user.email "ios-ci@users.noreply.github.com"
-          git checkout --orphan "ci-logs-${RUN_ID}" >/dev/null 2>&1 \
-            || git checkout -B "ci-logs-${RUN_ID}" >/dev/null 2>&1 || true
-          git rm -rf . >/dev/null 2>&1 || true
-          mkdir -p ci-logs
-          cp -R "$LOGS"/. ci-logs/ 2>/dev/null || true
-          # This step replaces the whole branch, and a manual session may still be
-          # running: carry its ci-logs/sessions/<run_id>/ address over, and keep the
-          # newest 20 so the branch does not grow with every session.
-          if git fetch -q "git@github.com:${APP_REPO}.git" ci-logs 2>/dev/null; then
-            git checkout FETCH_HEAD -- ci-logs/sessions 2>/dev/null || true
-            total=$(ls -1 ci-logs/sessions 2>/dev/null | wc -l | tr -d ' ')
-            drop=$((total - 20))
-            if (( drop > 0 )); then
-              ls -1 ci-logs/sessions | sort -n | sed -n "1,${drop}p" | while IFS= read -r old; do
-                rm -rf "ci-logs/sessions/$old"
-              done
-            fi
-          fi
-          # A branch-root README renders the run's screenshots inline and links the
-          # recording, so viewing a headless run is one click instead of a file hunt.
-          {
-            echo "# ios-ci run ${RUN_ID}"
-            echo
-            echo "correlation \`${CORRELATION}\`, app \`${APP_SHA}\` (${APP_REF}), ${SIMULATOR:-unknown simulator}."
-            echo
-            shown=0
-            if [[ "${MANUAL_MINUTES:-0}" != "0" ]]; then
-              echo "Manual session: ${MANUAL_MINUTES} minutes on a hosted VNC desktop."
-              if [[ -f ci-logs/manual-ready.txt ]]; then
-                echo
-                echo "VNC address: \`$(sed -n 's/^vnc_address: //p' ci-logs/manual-ready.txt | head -1)\` (VNC password from the \`VNC_PASSWORD\` secret)."
-              fi
-              echo
-            fi
-            for img in ci-logs/manual-start.png ci-logs/manual-end.png; do
-              [[ -f "$img" ]] || continue
-              shown=$((shown + 1))
-              echo "![manual session ${shown}](${img})"
-              echo
-            done
-            for img in $(find ci-logs -type f \( -name '*.png' -o -name '*.jpg' \) \
-              ! -name 'manual-*.png' 2>/dev/null | sort | head -n 6); do
-              shown=$((shown + 1))
-              echo "![screenshot ${shown}](${img})"
-              echo
-            done
-            if [[ "$shown" -eq 0 ]]; then
-              echo "_No screenshot in this run: the flow only captures one where it calls \`takeScreenshot\`._"
-              echo
-            fi
-            for vid in $(find ci-logs -type f \( -name '*.mp4' -o -name '*.mov' \) 2>/dev/null | sort | head -n 3); do
-              echo "[Recording: $(basename "$vid")](${vid})"
-              echo
-            done
-            echo "Raw logs: \`ci-logs/\` — \`summary.txt\`, per-attempt \`maestro-N.log\`, Maestro's \`debug-N/\` bundle."
-          } > README.md
-          git add -A ci-logs README.md >/dev/null 2>&1 || true
-          git commit -m "CI logs ${RUN_ID} (${CORRELATION})" >/dev/null 2>&1 \
-            || { echo "warning: nothing to commit"; exit 0; }
-          git push --force "git@github.com:${APP_REPO}.git" "HEAD:refs/heads/ci-logs" \
-            || echo "warning: could not publish logs"

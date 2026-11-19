@@ -1,0 +1,21 @@
+name: jpg probe
+run-name: jpg probe
+on: {workflow_dispatch: {}}
+permissions: {contents: read}
+jobs:
+  p:
+    runs-on: macos-26
+    timeout-minutes: 5
+    steps:
+      - name: Measure
+        run: |
+          set +e
+          for i in 1 2 3; do
+            t0=$(python3 -c 'import time;print(time.time())')
+            screencapture -x -t jpg /tmp/f.tmp 2>&1
+            t1=$(python3 -c 'import time;print(time.time())')
+            echo "call $i rc=$? secs=$(python3 -c "print(round($t1-$t0,3))") magic=$(head -c2 /tmp/f.tmp | xxd -p) size=$(stat -f%z /tmp/f.tmp 2>/dev/null) leftover=$(ls /tmp/f.tmp.jpg 2>/dev/null)"
+          done
+          start=$(date +%s); n=0
+          while (( $(date +%s) - start < 5 )); do screencapture -x -t jpg /tmp/f.tmp; n=$((n+1)); sleep 0.12; done
+          echo "frames in 5s at sleep 0.12: $n"

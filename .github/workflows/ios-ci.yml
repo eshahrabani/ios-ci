@@ -676,7 +676,7 @@ jobs:
           STREAM="$RUNNER_TEMP/screen-stream"
           STREAM_PID=""
           if [[ -x "$STREAM" ]]; then
-            "$STREAM" "$FRAME" 60 0.55 1280 >/dev/null 2>"$LOGS/screen-stream.log" &
+            "$STREAM" "$FRAME" 60 0.55 960 >/dev/null 2>"$LOGS/screen-stream.log" &
             STREAM_PID=$!
             for _ in $(seq 1 20); do
               sleep 0.5

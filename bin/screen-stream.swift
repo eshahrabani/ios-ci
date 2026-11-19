@@ -39,7 +39,6 @@ let statPath = outPath + ".stat"
 
 var displayWidth = 0
 var displayHeight = 0
-var lastAdjust = 0.0
 
 func jpegData(_ buffer: CVPixelBuffer, quality: Double) -> Data? {
     CVPixelBufferLockBaseAddress(buffer, .readOnly)
@@ -79,9 +78,7 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
     var encodeMS = 0.0
     var reportAt = 0.0
     var reportEncoded = 0
-    var slow = 0
     var onStop: (() -> Void)?
-    var onSlow: (() -> Void)?
 
     init(path: String, maxFPS: Double, quality: Double) {
         self.path = path
@@ -96,6 +93,7 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         delivered += 1
         let now = Date().timeIntervalSince1970
         if interval > 0 && now - last < interval { skipped += 1; return }
+        last = now          // arrival time: the encode itself must not lower the rate
         // No freshness filter here: the queue depth bounds the backlog, and a clock
         // comparison rejected every frame while a Metal-heavy app was on screen,
         // which froze the stream exactly when the tester needed it.
@@ -107,14 +105,6 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let data = jpegData(buffer, quality: quality) else { skipped += 1; return }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         encodeMS = encodeMS == 0 ? ms : encodeMS * 0.8 + ms * 0.2
-        // A GPU-heavy window (the iOS Simulator, Maps) can make the surface readback
-        // cost hundreds of milliseconds. Shrink the capture before the stream turns
-        // into a slideshow; the browser scales it back up.
-        slow = ms > 80 ? slow + 1 : max(0, slow - 1)
-        if slow >= 3 {
-            slow = 0
-            onSlow?()
-        }
         do {
             try data.write(to: URL(fileURLWithPath: temporary))
         } catch {
@@ -123,7 +113,6 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         let renamed = temporary.withCString { from in path.withCString { to in rename(from, to) } }
         if renamed != 0 { return }
-        last = now
         encoded += 1
         if encoded % 120 == 0 { err("frames \(encoded) \(data.count) bytes \(Int(ms))ms") }
     }
@@ -163,13 +152,6 @@ func startStream() {
             let sink = Sink(path: outPath, maxFPS: maxFPS, quality: quality)
             sink.onStop = {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { startStream() }
-            }
-            sink.onSlow = {
-                guard maxWidth > 768 else { return }
-                maxWidth = max(768, maxWidth * 3 / 4)
-                lastAdjust = Date().timeIntervalSince1970
-                err("capture is slow; dropping to max width \(maxWidth)")
-                DispatchQueue.main.async { startStream() }
             }
             sinkRef = sink
             displayWidth = display.width
@@ -399,14 +381,6 @@ func writeStat() {
         }
         sink.reportAt = now
         sink.reportEncoded = encoded
-        // Restore resolution once the heavy window is gone, at most every 10 s.
-        if sink.encodeMS > 0, sink.encodeMS < 8, maxWidth < 1280,
-           now - lastAdjust > 10 {
-            maxWidth = min(1280, maxWidth * 5 / 4)
-            lastAdjust = now
-            err("capture is fast again; raising max width to \(maxWidth)")
-            DispatchQueue.main.async { startStream() }
-        }
     }
     let stat: [String: Any] = ["fps": (fps * 10).rounded() / 10,
                                "encoded": encoded, "delivered": delivered,

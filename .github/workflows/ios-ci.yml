@@ -503,7 +503,10 @@ jobs:
           caffeinate -u -t 2 || true
           CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
           CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
-          echo "console user: ${CONSOLE_USER}"
+          CONSOLE_HOME=$(dscl . -read "/Users/${CONSOLE_USER}" NFSHomeDirectory 2>/dev/null \
+            | awk '{print $2}')
+          [[ -n "$CONSOLE_HOME" ]] || CONSOLE_HOME="/Users/${CONSOLE_USER}"
+          echo "console user: ${CONSOLE_USER} (${CONSOLE_HOME})"
 
           # Evidence that the desk exists, published with the address.
           screencapture -x "$LOGS/desktop.png" 2>&1 || true
@@ -575,8 +578,10 @@ jobs:
             [[ -s /tmp/desktop-frame.png ]] && break
             sleep 1
           done
+          # IOS_CI_UPLOAD_HOME: `launchctl asuser` keeps the uid (root), so the
+          # server cannot derive the tester's home from its own credentials.
           sudo launchctl asuser "$CONSOLE_UID" /bin/bash -c \
-            "nohup /usr/bin/python3 '$RUNNER_TEMP/desktop-server.py' 6080 '$TOKEN' '$HOST' > '$LOGS/desktop-server.log' 2>&1 &"
+            "IOS_CI_UPLOAD_HOME='$CONSOLE_HOME' nohup /usr/bin/python3 '$RUNNER_TEMP/desktop-server.py' 6080 '$TOKEN' '$HOST' > '$LOGS/desktop-server.log' 2>&1 &"
           sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
             -e 'tell application "System Events" to get name of first process' >/dev/null 2>&1 || true
           caffeinate -d -i -m -s -u -t 7200 &

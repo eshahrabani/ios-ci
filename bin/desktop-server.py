@@ -98,17 +98,52 @@ def run(cmd):
 def home_dir():
     """The tester's home directory, where uploads land.
 
-    The server starts under `sudo launchctl asuser`, and sudo keeps HOME=/var/root in
-    some configurations; resolving the account's home from the uid keeps files where
-    the console user's Finder and Terminal look for them.
+    `launchctl asuser` re-associates the session but does not change the uid: this
+    process still runs as root, so neither HOME nor the uid's home is the tester's
+    (~/.config under /var/root). The console user is the account the desk belongs to.
     """
     configured = os.environ.get("IOS_CI_UPLOAD_HOME")
     if configured:
         return configured
+    account = console_account()
+    if account:
+        return pwd.getpwuid(account[0]).pw_dir
+    return pwd.getpwuid(os.getuid()).pw_dir
+
+
+def console_account():
+    """(uid, gid) of the user owning /dev/console, or None when it cannot be read."""
     try:
-        return pwd.getpwuid(os.getuid()).pw_dir
+        result = subprocess.run(["stat", "-f%Su", "/dev/console"],
+                                capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    user = result.stdout.strip()
+    if result.returncode or not user or user == "root":
+        return None
+    try:
+        entry = pwd.getpwnam(user)
     except KeyError:
-        return os.path.expanduser("~")
+        return None
+    return entry.pw_uid, entry.pw_gid
+
+
+def hand_over(path):
+    """Give an upload to the console user; the server itself runs as root."""
+    account = console_account()
+    if os.getuid() != 0 or account is None:
+        return
+    uid, gid = account
+    for base, dirs, names in os.walk(path):
+        for name in dirs + names:
+            try:
+                os.lchown(os.path.join(base, name), uid, gid)
+            except OSError:
+                pass
+    try:
+        os.chown(path, uid, gid)
+    except OSError:
+        pass
 
 
 def archive_problem(path):
@@ -985,6 +1020,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 os.remove(target)
             os.replace(staging, target)
             staging = ""
+            hand_over(target)
             return self.send(json.dumps({"path": target, "files": files, "bytes": size}),
                              kind="application/json")
         except (OSError, subprocess.SubprocessError) as error:

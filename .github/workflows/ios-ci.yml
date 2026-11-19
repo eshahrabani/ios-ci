@@ -379,6 +379,8 @@ jobs:
           caffeinate -u -t 2 || true
 
           KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
+          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
+          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
           # Apple auth is the only path that streams on the Intel image; keep an account
           # whose password is known so the client can use it, and grant it ARD.
           if [[ -n "${VNC_USER_PASSWORD:-}" ]]; then
@@ -476,8 +478,6 @@ jobs:
 
           # Evidence that the desk exists, published with the address: the console
           # framebuffer captured as the logged-in user.
-          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
-          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
           echo "console user: ${CONSOLE_USER}"
           sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop.png" 2>&1 || true
 

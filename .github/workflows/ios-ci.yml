@@ -689,19 +689,14 @@ jobs:
             echo "== tailscale"
             if [[ -x "$TS" ]]; then "$TS" status 2>&1 | head -30; else echo "not installed"; fi
             echo
-            echo "== screen"
-            python3 - <<'PY' 2>&1 | head -5
-          import Quartz
-          d = Quartz.CGSessionCopyCurrentDictionary()
-          print(dict(d) if d else "no session")
-          PY
-            echo
             echo "== listeners"
-            sudo lsof -iTCP -sTCP:LISTEN 2>&1 | head -20
+            sudo lsof -iTCP -sTCP:LISTEN 2>&1 | grep -E '6080|rfb' | head -5
             echo
-            echo "== settings"
-            sudo ls -l /Library/Preferences/com.apple.VNCSettings.txt 2>&1
-            sudo defaults read /Library/Preferences/com.apple.RemoteManagement 2>&1 | grep -E 'VNCLegacy|ARD_All' 
+            echo "== desktop server log"
+            tail -20 "$LOGS/desktop-server.log" 2>&1
+            echo
+            echo "== frame"
+            ls -l /tmp/desktop-frame.png 2>&1
           } > "$LOGS/manual-diagnostics.txt" 2>&1
           true
 

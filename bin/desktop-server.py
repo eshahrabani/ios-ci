@@ -458,6 +458,8 @@ def ws_items(event):
         fy = max(0.0, min(1.0, float(event.get("fy", 0.5))))
         return fx * width, fy * height
 
+    if kind == "full":
+        return [{"t": "full"}]
     if kind == "mouse":
         x, y = point()
         action = event.get("e")

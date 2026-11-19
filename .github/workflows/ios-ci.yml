@@ -434,7 +434,6 @@ jobs:
             [[ -s /tmp/desktop-frame.png ]] && break
             sleep 1
           done
-          echo "capture loop frame bytes: $(stat -f%z /tmp/desktop-frame.png 2>/dev/null || echo 0)"
           sudo launchctl asuser "$CONSOLE_UID" /bin/bash -c \
             "nohup /usr/bin/python3 '$RUNNER_TEMP/desktop-server.py' 6080 '$TOKEN' '$HOST' > '$LOGS/desktop-server.log' 2>&1 &"
           sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
@@ -451,16 +450,19 @@ jobs:
             exit 1
           fi
           echo "desktop server listening"
-          echo "frame bytes: $(stat -f%z /tmp/desktop-frame.png 2>/dev/null || echo 0)"
           # Prove input works before publishing: a click on the Apple menu must change
-          # the frame, and the change must be undone by Escape.
-          sleep 1
-          BEFORE=$(shasum /tmp/desktop-frame.png | cut -d' ' -f1)
+          # the screen, and Escape must undo it. Both captures run in this step's own
+          # chain, which is the one carrying the grant.
+          screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null || true
+          chmod 644 /tmp/desktop-frame.png 2>/dev/null || true
+          echo "frame bytes: $(stat -f%z /tmp/desktop-frame.png 2>/dev/null || echo 0)"
+          BEFORE=$(shasum /tmp/desktop-frame.png 2>/dev/null | cut -d' ' -f1)
           curl -s -m 15 "http://${HOST}:${PORT}/click?fx=0.02&fy=0.02&t=${TOKEN}" >/dev/null || true
           sleep 2
-          AFTER=$(shasum /tmp/desktop-frame.png | cut -d' ' -f1)
+          screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null || true
+          AFTER=$(shasum /tmp/desktop-frame.png 2>/dev/null | cut -d' ' -f1)
           curl -s -m 15 "http://${HOST}:${PORT}/key?name=Escape&t=${TOKEN}" >/dev/null || true
-          if [[ "$BEFORE" == "$AFTER" ]]; then
+          if [[ -z "$BEFORE" || "$BEFORE" == "$AFTER" ]]; then
             echo "input self-test: NO CHANGE (clicks are not landing)"
           else
             echo "input self-test: click changed the screen"

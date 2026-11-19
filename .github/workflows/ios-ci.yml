@@ -640,17 +640,6 @@ jobs:
           CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
           sudo launchctl asuser "$CONSOLE_UID" /usr/bin/caffeinate -d -i -m -s -u \
             -t $(( 10#${MANUAL_MINUTES} * 60 + 600 )) 2>/dev/null &
-          # JPEG, written to a temp name and renamed: the server never reads a
-          # half-written frame, and a capture costs ~0.2 s, so this runs at several fps
-          # instead of the one frame per second a fixed sleep allowed.
-          (
-            set +e                     # one failed capture must not end the stream
-            while true; do
-              screencapture -x -t jpg "$FRAME.tmp" 2>/dev/null \
-                && mv -f "$FRAME.tmp" "$FRAME" 2>/dev/null
-              sleep 0.03
-            done
-          ) &
           # The desktop is the deliverable: open the tools the tester needs and give the
           # session a moment to come up before the first connection lands.
           # Only Finder: launching Xcode or the Simulator here saturates the 4-core VM
@@ -666,7 +655,17 @@ jobs:
           } > "$LOGS/manual-session.txt"
           echo "Manual session open for ${MANUAL_MINUTES} minutes; build ${APP_DIR:-the app} in Xcode."
           caffeinate -d -i -m -s -u -t $(( 10#${MANUAL_MINUTES} * 60 + 300 )) &
-          sleep $(( 10#${MANUAL_MINUTES} * 60 ))
+          # Capture in the foreground: a loop inside a background subshell is napped
+          # to about one frame a second, while the same loop from the step's own shell
+          # runs at the capture cost (~4 fps). The deadline does the holding.
+          END=$(( $(date +%s) + 10#${MANUAL_MINUTES} * 60 ))
+          set +e                       # one failed capture must not end the stream
+          while (( $(date +%s) < END )); do
+            screencapture -x -t jpg "$FRAME.tmp" 2>/dev/null \
+              && mv -f "$FRAME.tmp" "$FRAME" 2>/dev/null
+            sleep 0.03
+          done
+          set -e
           echo "ended: $(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$LOGS/manual-session.txt"
 
       # The public run's logs are deleted by cleanup.yml as soon as the job ends, so a

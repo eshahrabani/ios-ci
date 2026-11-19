@@ -78,7 +78,9 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
     var encodeMS = 0.0
     var reportAt = 0.0
     var reportEncoded = 0
+    var slow = 0
     var onStop: (() -> Void)?
+    var onSlow: (() -> Void)?
 
     init(path: String, maxFPS: Double, quality: Double) {
         self.path = path
@@ -93,13 +95,9 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         delivered += 1
         let now = Date().timeIntervalSince1970
         if interval > 0 && now - last < interval { skipped += 1; return }
-        // A frame that waited in the delivery queue is stale: the viewer wants the
-        // newest screen, so drop it instead of encoding a backlog.
-        let stamp = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        if stamp.isValid && stamp.seconds > 0 {
-            let host = CMClockGetTime(CMClockGetHostTimeClock()).seconds
-            if host - stamp.seconds > 0.15 { skipped += 1; return }
-        }
+        // No freshness filter here: the queue depth bounds the backlog, and a clock
+        // comparison rejected every frame while a Metal-heavy app was on screen,
+        // which froze the stream exactly when the tester needed it.
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
             skipped += 1
             return
@@ -108,6 +106,14 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         guard let data = jpegData(buffer, quality: quality) else { skipped += 1; return }
         let ms = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
         encodeMS = encodeMS == 0 ? ms : encodeMS * 0.8 + ms * 0.2
+        // A GPU-heavy window (the iOS Simulator, Maps) can make the surface readback
+        // cost hundreds of milliseconds. Shrink the capture before the stream turns
+        // into a slideshow; the browser scales it back up.
+        slow = ms > 80 ? slow + 1 : max(0, slow - 1)
+        if slow >= 3 {
+            slow = 0
+            onSlow?()
+        }
         do {
             try data.write(to: URL(fileURLWithPath: temporary))
         } catch {
@@ -156,6 +162,12 @@ func startStream() {
             let sink = Sink(path: outPath, maxFPS: maxFPS, quality: quality)
             sink.onStop = {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { startStream() }
+            }
+            sink.onSlow = {
+                guard maxWidth > 640 else { return }
+                maxWidth = max(640, maxWidth * 3 / 4)
+                err("capture is slow; dropping to max width \(maxWidth)")
+                DispatchQueue.main.async { startStream() }
             }
             sinkRef = sink
             displayWidth = display.width

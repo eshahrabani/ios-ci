@@ -64,7 +64,8 @@ func jpegData(_ buffer: CVPixelBuffer, quality: Double,
         let bytes = UnsafeMutableRawPointer.allocate(byteCount: rowBytes * box.h,
                                                      alignment: 64)
         for row in 0..<box.h {
-            memcpy(bytes + row * rowBytes, base + (box.y + row) * stride + box.x * 4,
+            memcpy(bytes.advanced(by: row * rowBytes),
+                   UnsafeRawPointer(base).advanced(by: (box.y + row) * stride + box.x * 4),
                    rowBytes)
         }
         guard let crop = CGDataProvider(
@@ -143,8 +144,8 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
             old.withUnsafeBufferPointer { prev in
                 guard let prevBase = prev.baseAddress else { return }
                 for y in 0..<height {
-                    let current = base + y * stride
-                    let oldRow = prevBase + y * rowBytes
+                    let current = UnsafeRawPointer(base).advanced(by: y * stride)
+                    let oldRow = UnsafeRawPointer(prevBase).advanced(by: y * rowBytes)
                     if memcmp(current, oldRow, rowBytes) == 0 { continue }
                     changed = true
                     if y < top { top = y }
@@ -171,7 +172,8 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         copy.withUnsafeMutableBufferPointer { out in
             guard let outBase = out.baseAddress else { return }
             for y in 0..<height {
-                memcpy(outBase + y * rowBytes, base + y * stride, rowBytes)
+                memcpy(UnsafeMutableRawPointer(outBase).advanced(by: y * rowBytes),
+                       UnsafeRawPointer(base).advanced(by: y * stride), rowBytes)
             }
         }
         previous = copy

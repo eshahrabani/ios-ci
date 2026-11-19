@@ -395,11 +395,11 @@ jobs:
           STREAM="$RUNNER_TEMP/screen-stream"
           if curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/screen-stream.swift" \
               -o "$RUNNER_TEMP/screen-stream.swift"; then
-            if xcrun swiftc -O -swift-version 5 -o "$STREAM" "$RUNNER_TEMP/screen-stream.swift" 2>&1 | tail -5; then
-              echo "streamer built: ${STREAM}"
-            else
-              echo "warning: could not build the screen streamer; the hold will use screencapture"
+            if ! xcrun swiftc -O -swift-version 5 -o "$STREAM" "$RUNNER_TEMP/screen-stream.swift" 2>&1 | tail -20; then
+              echo "error: could not build the screen streamer; the desktop would fall back to a 5 fps capture loop"
+              exit 1
             fi
+            echo "streamer built: ${STREAM}"
           fi
           # Accessibility and capture for the injected events, in BOTH databases: the
           # console session consults its own user database, and a grant only in the

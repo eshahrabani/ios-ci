@@ -96,6 +96,13 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
 var sinkRef: Sink?
 var streamRef: SCStream?
 
+// ScreenCaptureKit only delivers frames when the screen changes, so an idle desktop is
+// indistinguishable from a dead capture. The heartbeat tells the server which it is.
+let beatPath = outPath + ".beat"
+func beat() {
+    try? Data().write(to: URL(fileURLWithPath: beatPath))
+}
+
 Task {
     do {
         let content = try await SCShareableContent.excludingDesktopWindows(false,
@@ -128,4 +135,7 @@ Task {
     }
 }
 
+beat()
+let heartbeat = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in beat() }
+heartbeat.tolerance = 0.2
 RunLoop.main.run()

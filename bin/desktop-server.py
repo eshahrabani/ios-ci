@@ -28,6 +28,7 @@ PORT = int(sys.argv[1])
 TOKEN = sys.argv[2]
 BIND = sys.argv[3] if len(sys.argv) > 3 else "0.0.0.0"
 FRAME = "/tmp/desktop-frame.jpg"
+BEAT = FRAME + ".beat"                  # touched every second by the capture process
 
 LOCK = threading.Lock()
 COND = threading.Condition(LOCK)
@@ -271,15 +272,14 @@ addEventListener('keydown', e => {
 });
 addEventListener('blur', flush);
 
-let lastStamp = 0, lastChange = Date.now(), statsFailures = 0;
+let statsFailures = 0;
 setInterval(async () => {
   try {
     const r = await fetch('/stats?t=' + token, {cache: 'no-store'});
     const s = await r.json();
     statsFailures = 0;
-    if (s.stamp !== lastStamp) { lastStamp = s.stamp; lastChange = Date.now(); }
     const size = s.width ? s.width + 'x' + s.height : 'no frame';
-    const stalled = s.stamp && Date.now() - lastChange > 8000;
+    const stalled = s.alive === false;
     log('desktop ' + size + '  capture ' + s.fps + ' fps' +
         (stalled ? '  STALLED (capture stopped)' : '') + hint);
   } catch (err) {
@@ -359,9 +359,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             with COND:
                 stamp, data = frame_locked()
                 recent = [t for t in STATS["recent"] if now - t <= 2.0]
+                try:
+                    beat_age = now - os.stat(BEAT).st_mtime
+                except OSError:
+                    beat_age = None
+                # A fresh heartbeat or a fresh frame means capture is alive; an idle
+                # screen produces no frames, which is not a stall.
+                alive = ((beat_age is not None and beat_age < 5)
+                         or (bool(stamp) and now - stamp < 3))
                 payload = {"stamp": round(stamp, 3), "frames": STATS["frames"],
                            "fps": round(len(recent) / 2.0, 1),
-                           "width": DIMS[0], "height": DIMS[1],
+                           "width": DIMS[0], "height": DIMS[1], "alive": alive,
                            "age": round(now - stamp, 1) if stamp and data else None}
             return self.send(json.dumps(payload), kind="application/json")
         if url.path in ("/frame.jpg", "/frame.png"):

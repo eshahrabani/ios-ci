@@ -19,6 +19,7 @@ import urllib.parse
 
 PORT = int(sys.argv[1])
 TOKEN = sys.argv[2]
+MODE = sys.argv[4] if len(sys.argv) > 4 else "desktop"
 FRAME = "/tmp/desktop-frame.png"
 LOCK = threading.Lock()
 LAST = [0.0, b""]
@@ -174,6 +175,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return int(fx * width), int(fy * height)
 
             x, y = point("")
+            if MODE == "sim":
+                # Clicks must land inside the Simulator window, not on the desktop.
+                rect = run(["osascript", "-e",
+                            'tell application "System Events" to tell process "Simulator" '
+                            'to get {position, size} of window 1']).stdout.strip()
+                numbers = [int(n) for n in rect.replace("{", " ").replace("}", " ")
+                           .replace(",", " ").split() if n.lstrip("-").isdigit()]
+                if len(numbers) >= 4:
+                    wx, wy, ww, wh = numbers[:4]
+                    x = wx + int(x * ww / max(width, 1))
+                    y = wy + int(y * wh / max(height, 1))
             if not CLICLICK:
                 return self.send(b"cliclick is not installed", status=503)
             if url.path == "/click":

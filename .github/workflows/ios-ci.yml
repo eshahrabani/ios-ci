@@ -388,7 +388,7 @@ jobs:
           echo "cliclick: ${CLICLICK}"
 
           # `screencapture` costs ~0.15 s per call and caps a capture loop near 6 fps.
-          # This streams compositor frames instead (25+ fps measured on this image).
+          # This streams compositor frames instead (45-55 fps measured on this image).
           # Built from the running commit so the binary matches the server, and built
           # here because the hold step needs it already present. A failure is not fatal:
           # the hold step falls back to the screencapture loop.

@@ -53,9 +53,9 @@ options:
 manual sessions:
   no build runs: the app is cloned into ~/<app> on the desktop, with Xcode, the iOS
   simulators, node and yarn ready, so the build happens graphically.
-  The desktop is served over the tailnet as PNG frames with clicks and keys injected
-  (Screen Sharing itself cannot capture on macOS 26: its agent needs a managed
-  permission profile, which a hosted runner cannot install).
+  The desktop is served over the tailnet as PNG frames with clicks, drags and keys
+  injected. Screen Sharing is not used: on macOS 26 its agent cannot capture this
+  image's display ("Unable to capture screen"), so clients would see a black frame.
   The tester's machine must be on the same tailnet. Repo secrets: TAILSCALE_AUTH_KEY
   (a reusable auth key: tskey-auth-…). The CLI prints the desktop URL with its
   per-run token when the desktop is ready. --manual accepts 1-300 minutes.

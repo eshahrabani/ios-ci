@@ -1,0 +1,5 @@
+run_id: 44364404189
+vnc_address: ios-ci-44364404189.tailca27e.ts.net:5900
+vnc_user: runner
+session_minutes: 5
+ready_at: 2026-11-18T17:59:51Z

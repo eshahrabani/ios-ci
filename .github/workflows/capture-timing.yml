@@ -1,0 +1,42 @@
+name: capture-timing
+run-name: capture timing
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  timing:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - name: Time repeated captures in the job shell
+        run: |
+          set +e
+          echo "== five single captures"
+          for i in 1 2 3 4 5; do
+            start=$(python3 -c 'import time; print(time.time())')
+            screencapture -x /tmp/t-$i.png
+            end=$(python3 -c 'import time; print(time.time())')
+            echo "capture $i took $(python3 -c "print(round($end-$start,2))")s size=$(stat -f%z /tmp/t-$i.png 2>/dev/null)"
+          done
+          echo "== a 20 second loop at 1 Hz"
+          start=$(date +%s)
+          for i in $(seq 1 20); do
+            screencapture -x /tmp/loop.png
+            printf '%s %s %s\n' "$(date +%s)" "$(( $(date +%s) - start ))" "$(stat -f%z /tmp/loop.png 2>/dev/null)"
+            sleep 1
+          done | tail -20
+          echo "== same from a background subshell (like the hold step)"
+          (
+            set +e
+            for i in $(seq 1 10); do
+              t0=$(date +%s)
+              screencapture -x /tmp/bg.png
+              echo "bg $(date +%s) start=$t0 size=$(stat -f%z /tmp/bg.png 2>/dev/null)"
+              sleep 1
+            done
+          ) &
+          wait

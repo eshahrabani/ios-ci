@@ -96,6 +96,32 @@ func jpegData(_ buffer: CVPixelBuffer, quality: Double,
     return data as Data
 }
 
+func jpegPixels(_ pixels: [UInt8], width: Int, height: Int, quality: Double) -> Data? {
+    // Encode a packed 32-bit BGRA buffer, so a frame the compositor already delivered
+    // can be written again without waiting for another capture.
+    let rowBytes = width * 4
+    guard width > 0, height > 0, pixels.count == rowBytes * height else { return nil }
+    return pixels.withUnsafeBytes { raw -> Data? in
+        guard let base = raw.baseAddress,
+              let provider = CGDataProvider(dataInfo: nil, data: base, size: raw.count,
+                                            releaseData: { _, _, _ in }) else { return nil }
+        let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipFirst.rawValue
+            | CGBitmapInfo.byteOrder32Little.rawValue)
+        guard let image = CGImage(width: width, height: height, bitsPerComponent: 8,
+                                  bitsPerPixel: 32, bytesPerRow: rowBytes,
+                                  space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: info,
+                                  provider: provider, decode: nil, shouldInterpolate: false,
+                                  intent: .defaultIntent) else { return nil }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            data, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(destination, image,
+            [kCGImageDestinationLossyCompressionQuality: NSNumber(value: quality)] as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return data as Data
+    }
+}
+
 final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
     let path: String
     let temporary: String
@@ -216,6 +242,11 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         var payload = Data(header.utf8)
         payload.append(jpeg)
+        write(payload)
+        if encoded % 120 == 0 { err("frames \(encoded) \(payload.count) bytes \(Int(ms))ms") }
+    }
+
+    private func write(_ payload: Data) {
         do {
             try payload.write(to: URL(fileURLWithPath: temporary))
         } catch {
@@ -225,7 +256,23 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
         let renamed = temporary.withCString { from in path.withCString { to in rename(from, to) } }
         if renamed != 0 { return }
         encoded += 1
-        if encoded % 120 == 0 { err("frames \(encoded) \(payload.count) bytes \(Int(ms))ms") }
+    }
+
+    /// Rewrite the last captured framebuffer as a full frame. A client asks for this
+    /// when it missed a crop, and the screen may be idle: waiting for the compositor to
+    /// deliver another frame could leave it frozen until the next change. The buffer is
+    /// the sender's current picture, so the client lands exactly on the state the next
+    /// crop will assume.
+    func replayFull() {
+        let width = previousWidth, height = previousHeight
+        guard width > 0, height > 0, let pixels = previous,
+              let jpeg = jpegPixels(pixels, width: width, height: height, quality: quality)
+        else { return }
+        sequence += 1
+        sinceFull = 0
+        var payload = Data("RECT F 0 0 \(width) \(height) \(sequence)\n".utf8)
+        payload.append(jpeg)
+        write(payload)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
@@ -236,6 +283,8 @@ final class Sink: NSObject, SCStreamOutput, SCStreamDelegate {
 
 var sinkRef: Sink?
 var streamRef: SCStream?
+// One serial queue owns the framebuffer: samples and the replay a client asks for.
+let sampleQueue = DispatchQueue(label: "frames")
 var starting = false
 
 func startStream() {
@@ -271,7 +320,7 @@ func startStream() {
             let stream = SCStream(filter: filter, configuration: configuration, delegate: sink)
             streamRef = stream
             try stream.addStreamOutput(sink, type: .screen,
-                                       sampleHandlerQueue: DispatchQueue(label: "frames"))
+                                       sampleHandlerQueue: sampleQueue)
             try await stream.startCapture()
             err("streaming \(configuration.width)x\(configuration.height) at \(Int(maxFPS)) fps to \(outPath)")
         } catch {
@@ -352,6 +401,7 @@ final class InputAgent {
             scroll(message)
         case "full":
             DispatchQueue.main.async { sinkRef?.forceFull = true }
+            sampleQueue.async { sinkRef?.replayFull() }
         case "config":
             if let width = message["width"] as? Int, width > 0 { maxWidth = width }
             if let fps = message["fps"] as? Double, fps >= 1 { maxFPS = min(120, fps) }

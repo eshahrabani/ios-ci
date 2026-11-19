@@ -544,7 +544,7 @@ function log(message) { hud.textContent = message; }
 // TCP keeps the order, so a keystroke costs one one-way trip instead of a full
 // request/response round trip per character.
 let ws = null, decoding = false, haveFull = false, shownAt = [];
-let streamWidth = 0, tuningAt = 0;
+let streamWidth = 0, tuningAt = 0, stepDirection = 0, stepAt = 0;
 // A slow client (a software compositor, a weak link) paints far below the capture
 // rate, and every frame costs pixels twice over: once to decode and once to fill the
 // canvas. Step the capture size down until the paint rate fits, and back up when it
@@ -558,9 +558,14 @@ function tune() {
   const shown = recent.length / 2;
   let next = streamWidth;
   if (shown < 12) next = Math.max(560, Math.round(streamWidth * 0.8 / 40) * 40);
-  else if (shown > 26) next = Math.min(960, Math.round(streamWidth * 1.15 / 40) * 40);
+  else if (shown >= 27) next = Math.min(960, Math.round(streamWidth * 1.15 / 40) * 40);
   if (next === streamWidth) return;
+  // The restart itself starves the next window, so never reverse a step within 20 s.
+  const up = next > streamWidth;
+  if (stepDirection !== 0 && (up !== (stepDirection > 0)) && now - stepAt < 20000) return;
   tuningAt = now;
+  stepDirection = up ? 1 : -1;
+  stepAt = now;
   streamWidth = next;
   fetch('/config?width=' + next + '&t=' + encodeURIComponent(token));
 }

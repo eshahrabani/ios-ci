@@ -27,6 +27,11 @@ the screen. A client turns its light green only when frames and input both work.
 
 Uploads go the other way: POST /upload?t=<token>&name=<dir> stores a tar.gz in the
 tester's home, so a directory from their machine appears inside the session.
+
+Git credentials arrive through POST /git-setup: the local identity, the GitHub host and
+a token are written into the console user's global git config plus a credential helper,
+so private clones work with both HTTPS and SSH-form URLs. `/stats.tools` reports what
+provisioning installed and whether Git authentication is configured.
 """
 import base64
 import collections
@@ -67,6 +72,31 @@ INPUT_PORT = int(os.environ.get("INPUT_PORT", "7777"))
 INPUT_SOCKET = [None]                   # connection to the capture process's input agent
 INPUT_QUEUE = collections.deque()       # one ordered queue: keystrokes must not reorder
 INPUT_COND = threading.Condition()
+
+# Git hand-off and the /stats tool facts. Neither ever exposes the session token or the
+# GitHub token; the app reads these facts before it turns its light green.
+GIT_SETUP_LOCK = threading.Lock()
+TOOLS_LOCK = threading.Lock()
+TOOLS_CACHE = [0.0, {}]                 # expiry, flat facts
+TOOLS_TTL = 10.0
+ENV_FILE = "/tmp/ios-ci-env.json"
+GIT_DIR = (".config", "ios-ci")
+GIT_TOKEN_NAME = "github-token"
+GIT_HELPER_NAME = "git-credential-ios-ci"
+GIT_MARKER_NAME = "git-configured.json"
+GIT_BODY_MAX = 64 * 1024
+GIT_HELPER = (
+    "#!/bin/sh\n"
+    "case \"$1\" in\n"
+    "  get)\n"
+    "    printf 'username=x-access-token\\n'\n"
+    "    printf 'password=%s\\n' \"$(cat \"$HOME/.config/ios-ci/github-token\")\"\n"
+    "    ;;\n"
+    "  store|erase)\n"
+    "    exit 0\n"
+    "    ;;\n"
+    "esac\n"
+)
 
 LOCK = threading.Lock()
 COND = threading.Condition(LOCK)
@@ -146,6 +176,60 @@ def console_account():
     return entry.pw_uid, entry.pw_gid
 
 
+def console_context():
+    """uid/gid/user/home for the account whose desktop is being streamed."""
+    account = console_account()
+    if os.geteuid() == 0 and account is not None:
+        uid, gid = account
+    else:
+        uid, gid = os.getuid(), os.getgid()
+    try:
+        user = pwd.getpwuid(uid).pw_name
+    except KeyError:
+        user = os.environ.get("USER", "root")
+    return {"uid": uid, "gid": gid, "user": user, "home": home_dir()}
+
+
+def user_run(ctx, cmd, timeout=30, stdin_text=None, extra_env=None):
+    """Run one command as the console user when this server runs as root."""
+    kwargs = {"capture_output": True, "text": True, "timeout": timeout}
+    if stdin_text is not None:
+        kwargs["input"] = stdin_text
+    if os.geteuid() == 0:
+        env = {"HOME": ctx["home"], "USER": ctx["user"],
+               "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"}
+        if extra_env:
+            env.update(extra_env)
+        kwargs.update({"user": ctx["uid"], "group": ctx["gid"], "env": env})
+    elif extra_env:
+        env = dict(os.environ)
+        env.update(extra_env)
+        kwargs["env"] = env
+    return subprocess.run(cmd, **kwargs)
+
+
+def chown_user(ctx, path):
+    if os.geteuid() != 0:
+        return
+    try:
+        os.chown(path, ctx["uid"], ctx["gid"])
+    except OSError:
+        pass
+
+
+def write_user_file(ctx, path, data, mode):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(data if isinstance(data, bytes) else data.encode())
+    os.chmod(path, mode)
+    chown_user(ctx, path)
+
+
+def redact(text, secret):
+    text = str(text or "")
+    return text.replace(secret, "<token>") if secret else text
+
+
 def hand_over(path):
     """Give an upload to the console user; the server itself runs as root."""
     account = console_account()
@@ -162,6 +246,178 @@ def hand_over(path):
         os.chown(path, uid, gid)
     except OSError:
         pass
+
+
+def env_facts():
+    """The provisioning facts vm-provision.sh leaves behind, tolerating absence."""
+    try:
+        with open(ENV_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    keys = ("xcode", "xcode_path", "ios_runtime", "simulator", "simulator_udid",
+            "simulator_booted", "node", "yarn", "git")
+    return {key: data[key] for key in keys if key in data}
+
+
+def marker_facts():
+    """Identity and auth facts written by /git-setup. Never includes a token."""
+    directory = os.path.join(home_dir(), *GIT_DIR)
+    marker_path = os.path.join(directory, GIT_MARKER_NAME)
+    token_path = os.path.join(directory, GIT_TOKEN_NAME)
+    facts = {}
+    marker = None
+    try:
+        with open(marker_path, "r", encoding="utf-8") as handle:
+            marker = json.load(handle)
+    except (OSError, ValueError):
+        marker = None
+    if isinstance(marker, dict):
+        for key in ("name", "email", "host", "login"):
+            value = marker.get(key)
+            if isinstance(value, str) and value:
+                facts["git_" + key] = value
+    try:
+        token_ok = os.path.getsize(token_path) > 0
+    except OSError:
+        token_ok = False
+    facts["git_auth"] = bool(token_ok and isinstance(marker, dict))
+    return facts
+
+
+def tools_facts():
+    """Flat /stats facts: file reads only, computed before the frame lock, cached 10 s."""
+    now = time.time()
+    with TOOLS_LOCK:
+        if TOOLS_CACHE[0] > now:
+            return dict(TOOLS_CACHE[1])
+    facts = {}
+    facts.update(env_facts())
+    facts.update(marker_facts())
+    with TOOLS_LOCK:
+        TOOLS_CACHE[0] = time.time() + TOOLS_TTL
+        TOOLS_CACHE[1] = facts
+    return dict(facts)
+
+
+class GitSetupError(Exception):
+    pass
+
+
+def valid_git_request(payload):
+    """(request, error) for the /git-setup body."""
+    if not isinstance(payload, dict):
+        return None, "invalid JSON body"
+    name = payload.get("name")
+    email = payload.get("email")
+    host = payload.get("host")
+    token = payload.get("token")
+    if not isinstance(name, str):
+        return None, "name is required"
+    name = name.strip()
+    if not 1 <= len(name) <= 100 or not all(ch.isprintable() for ch in name):
+        return None, "name must be 1-100 printable characters"
+    if not isinstance(email, str) or len(email) > 254 \
+            or not re.fullmatch(r"[^@\s]+@[^@\s]+", email):
+        return None, "email must look like name@example.com"
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return None, "host must be a hostname"
+    if not isinstance(token, str) or not re.fullmatch(r"\S{8,4096}", token):
+        return None, "token must be 8-4096 characters without whitespace"
+    return {"name": name, "email": email, "host": host.lower(), "token": token}, ""
+
+
+def apply_git_setup(name, email, host, token):
+    """Write the credential helper and global git config for the console user."""
+    ctx = console_context()
+    config_home = os.path.join(ctx["home"], ".config")
+    directory = os.path.join(config_home, GIT_DIR[1])
+    try:
+        os.makedirs(config_home, mode=0o700, exist_ok=True)
+        chown_user(ctx, config_home)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        chown_user(ctx, directory)
+        write_user_file(ctx, os.path.join(directory, GIT_TOKEN_NAME), token + "\n", 0o600)
+        helper_path = os.path.join(directory, GIT_HELPER_NAME)
+        write_user_file(ctx, helper_path, GIT_HELPER, 0o700)
+    except OSError as error:
+        raise GitSetupError("could not write %s: %s" % (directory, error))
+
+    commands = [
+        (["git", "config", "--global", "--replace-all", "user.name", name], True),
+        (["git", "config", "--global", "--replace-all", "user.email", email], True),
+        (["git", "config", "--global",
+          "credential.https://%s.helper" % host, helper_path], True),
+        # Clearing first keeps a retry from stacking duplicate rewrite rules.
+        (["git", "config", "--global", "--unset-all",
+          "url.https://%s/.insteadOf" % host], False),
+        (["git", "config", "--global", "--add",
+          "url.https://%s/.insteadOf" % host, "git@%s:" % host], True),
+        (["git", "config", "--global", "--add",
+          "url.https://%s/.insteadOf" % host, "ssh://git@%s/" % host], True),
+    ]
+    for command, required in commands:
+        result = user_run(ctx, command, timeout=30)
+        if not required or not result.returncode:
+            continue
+        line = (result.stderr or result.stdout).strip().splitlines()
+        message = line[0] if line else "exit %s" % result.returncode
+        raise GitSetupError("git configuration failed: " + redact(message[:200], token))
+
+    login = ""
+    probe = user_run(ctx, ["/bin/sh", "-c", "command -v gh"], timeout=10)
+    if probe.returncode == 0 and probe.stdout.strip():
+        login_result = user_run(
+            ctx, ["gh", "auth", "login", "--hostname", host, "--with-token"],
+            timeout=60, stdin_text=token + "\n")
+        if login_result.returncode:
+            # A locked or unavailable keychain is not a reason to leave gh signed out.
+            login_result = user_run(
+                ctx, ["gh", "auth", "login", "--hostname", host, "--with-token",
+                      "--insecure-storage"],
+                timeout=60, stdin_text=token + "\n")
+        if login_result.returncode:
+            line = (login_result.stderr or login_result.stdout).strip().splitlines()
+            message = line[0] if line else "exit %s" % login_result.returncode
+            raise GitSetupError(
+                "gh could not store the token: " + redact(message[:200], token))
+        api_result = user_run(
+            ctx, ["gh", "api", "--hostname", host, "user", "--jq", ".login"],
+            timeout=30, extra_env={"GH_TOKEN": token})
+        if api_result.returncode:
+            line = (api_result.stderr or api_result.stdout).strip().splitlines()
+            message = line[0] if line else "exit %s" % api_result.returncode
+            raise GitSetupError(
+                "the token was rejected: " + redact(message[:200], token))
+        login = api_result.stdout.strip()
+        if not login:
+            raise GitSetupError("the token did not resolve to a GitHub login")
+
+    # Prove the helper answers before the app calls Git configured.
+    fill = user_run(ctx, ["git", "credential", "fill"], timeout=30,
+                    stdin_text="protocol=https\nhost=%s\n\n" % host,
+                    extra_env={"GIT_TERMINAL_PROMPT": "0"})
+    password = ""
+    for line in fill.stdout.splitlines():
+        if line.startswith("password="):
+            password = line[len("password="):].strip()
+            break
+    if fill.returncode or not password:
+        raise GitSetupError("the credential helper did not return a password")
+
+    marker = {"name": name, "email": email, "host": host, "login": login}
+    try:
+        write_user_file(ctx, os.path.join(directory, GIT_MARKER_NAME),
+                        json.dumps(marker, indent=2, sort_keys=True) + "\n", 0o644)
+    except OSError as error:
+        raise GitSetupError("could not write the Git marker: %s" % error)
+    with TOOLS_LOCK:
+        TOOLS_CACHE[0] = 0.0
+        TOOLS_CACHE[1] = {}
+    return {"ok": True, "name": name, "email": email, "host": host, "login": login,
+            "credential_helper": True}
 
 
 def archive_problem(path):
@@ -939,6 +1195,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
         if url.path == "/stats":
             now = time.time()
+            # Computed before the frame lock: every subprocess-free fact, cached 10 s.
+            tools = tools_facts()
             with COND:
                 stamp, data = frame_locked()
                 recent = [t for t in STATS["recent"] if now - t <= 2.0]
@@ -960,7 +1218,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                            "age": round(now - stamp, 1) if stamp and data else None,
                            "ms": stat.get("ms"), "delivered": stat.get("delivered"),
                            "encoded": stat.get("encoded"), "skipped": stat.get("skipped"),
-                           "dw": stat.get("dw"), "dh": stat.get("dh")}
+                           "dw": stat.get("dw"), "dh": stat.get("dh"),
+                           "tools": tools}
             return self.send(json.dumps(payload), kind="application/json")
         if url.path in ("/frame.jpg", "/frame.png"):
             since = query.get("since", ["0"])[0]
@@ -1060,6 +1319,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(f"key {name}")
         return self.send("not found", status=404)
 
+    def git_setup(self):
+        """POST /git-setup: identity, token and credential helper for the console user."""
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except (TypeError, ValueError):
+            return self.send(json.dumps({"error": "Content-Length required"}),
+                             kind="application/json", status=400)
+        if not 1 <= length <= GIT_BODY_MAX:
+            return self.send(
+                json.dumps({"error": "the body must be 1 byte to 64 KiB"}),
+                kind="application/json", status=400)
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except ValueError:
+            return self.send(json.dumps({"error": "invalid JSON body"}),
+                             kind="application/json", status=400)
+        request, error = valid_git_request(payload)
+        if error:
+            return self.send(json.dumps({"error": error}),
+                             kind="application/json", status=400)
+        with GIT_SETUP_LOCK:
+            try:
+                result = apply_git_setup(**request)
+            except GitSetupError as failure:
+                return self.send(json.dumps({"error": str(failure)}),
+                                 kind="application/json", status=500)
+            except (OSError, subprocess.SubprocessError) as failure:
+                return self.send(
+                    json.dumps({"error": "git setup failed: %s" % failure}),
+                    kind="application/json", status=500)
+        return self.send(json.dumps(result), kind="application/json")
+
     def receive(self, path, length):
         """Stream the request body into path; False when it ends early."""
         left = length
@@ -1077,6 +1368,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(url.query)
         if not allowed(query.get("t", [""])[0]):
             return self.send("forbidden", status=403)
+        if url.path == "/git-setup":
+            return self.git_setup()
         if url.path != "/upload":
             return self.send("not found", status=404)
         name = query.get("name", [""])[0]

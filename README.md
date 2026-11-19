@@ -2,51 +2,77 @@
 
 CI configuration only. No application source is stored here.
 
-One dispatch hands over a generic macOS desktop: a GitHub-hosted runner joins your
-tailnet, serves its screen to a browser page, injects your clicks and keys, and holds
-the VM for the minutes you asked for. Nothing is checked out, nothing is opened, and
-no app is involved — it is a desktop you drive yourself.
+`ios-ci` starts a GitHub Actions run that hands over a generic macOS desktop: the runner
+joins your tailnet, serves its screen to a browser page, injects your clicks and keys,
+and holds the VM for the minutes you asked for. The local client is an Electron app with
+a setup wizard, one-click sessions, history, and the streamed desktop in a window.
+
+Every booted VM is provisioned before the desktop is served: Xcode, an iOS runtime with a
+booted iPhone simulator, Node.js, Yarn 4 and Git. Your Git name, email and GitHub
+credentials are installed too, so a private clone works immediately.
+
+## Requirements
+
+- Node.js 22.12 or newer (for the app).
+- `gh`, authenticated with `repo` and `workflow` scopes.
+- `tailscale`, connected to the tailnet.
+- On the runner repository: the `TAILSCALE_AUTH_KEY` secret, a reusable auth key
+  (`tskey-auth-…`) from <https://login.tailscale.com/admin/settings/keys> — not an OAuth
+  client secret. The wizard saves it for you.
 
 ## Quickstart
 
-Requires `gh` (authenticated), `jq`, `tailscale` (connected to the tailnet) and
-`python3`. The runner repository needs one secret, `TAILSCALE_AUTH_KEY`: a **reusable
-auth key** (`tskey-auth-…`) from
-<https://login.tailscale.com/admin/settings/keys>, not an OAuth client secret.
-
 ```bash
-gh secret set TAILSCALE_AUTH_KEY --repo eshahrabani/ios-ci
-bin/ios-ci.sh session 30          # dispatch, wait for ready, print the URL
-bin/ios-ci-gui                    # the same session with a window around it
+npm install
+npm start            # or ./run.sh
 ```
 
-Both print (or show) a URL like `http://100.64.0.9:6080/?t=…`. Open it in a browser:
-that is the desktop. The page holds one WebSocket, so the VM streams compositor frames
-and the browser paints only what changed; clicks, drags, scrolling, typing and Cmd-key
-chords go back over the same socket. Treat the URL as a password — it grants control of
-the desktop.
+The setup wizard checks GitHub CLI, sign-in and scopes, Tailscale, the tailnet, the runner
+repository and its workflow, the Tailscale secret, and the Git identity. `Fix what I can`
+repairs everything except the auth key, which is the one value that cannot be derived
+from your machine. Once every row passes, the session view is one click away.
 
-Expect the URL about a minute after starting, depending on the GitHub runner queue.
-`bin/ios-ci-gui` shows the queue and each phase with a percent and an ETA, and turns its
-button green only when `/stats` proves both frames and input work. The first session at
-a new commit compiles the screen streamer (~25 s); later sessions restore it from the
-cache.
+```bash
+gh secret set TAILSCALE_AUTH_KEY --repo <owner>/<repo>   # equivalent to the wizard's key form
+```
 
-The session token is generated on your machine and never leaves it: only its SHA-256 is
-dispatched, so a run's metadata is not a credential. The token lives in the GUI's
-settings file (mode 0600) so a restart can reconnect.
+Session settings live under Electron's `userData` directory (`settings.json`, mode 0600).
+`IOS_CI_CONFIG_DIR` overrides that directory; `IOS_CI_RUNNER` changes the default runner
+repository; `IOS_CI_REF` dispatches a branch instead of `main`.
 
-## The desktop
+## The session
 
-* `bin/ios-ci.sh session [minutes]` — 1–300 minutes, default 30. The clock starts when
-  the desktop is ready, not at dispatch. Stop early with
-  `gh run cancel <run_id> --repo <runner>`.
-* `bin/ios-ci-gui` — minutes, live progress with a per-step breakdown, the green ready
-  light, recent sessions with their remaining time, and an optional local directory.
-  The directory is copied into `~/<name>` in the VM as soon as the desktop is ready (or
-  with **Copy now**), and the first start creates a venv under `~/.cache/ios-ci-gui`
-  with PySide6.
-* Both machines must be on the same tailnet, and its ACLs must allow TCP 6080 to the
-  runner node. If the node appears but the probe times out, that is an ACL.
+* The duration is 15, 30, 60 or 120 minutes, or 1–300 custom. The clock starts when the
+  desktop is ready, not at dispatch.
+* The app polls `gh` and the runner's `/stats`, and turns green only when frames, input,
+  the toolchain and Git credentials all report ready.
+* An optional local folder is copied into `~/<name>` in the VM when the desktop is ready,
+  or with **Copy now**.
+* The session token is generated locally; only its SHA-256 is dispatched, so a run's
+  metadata is not a credential. It lives in the settings file so a restart can reconnect.
 
-Run `bin/ios-ci.sh --help` for the full usage.
+Expect the desktop about a minute after starting, depending on the runner queue. The
+first session at a new commit compiles the screen streamer (~25 s); later sessions restore
+it from the cache. Provisioning adds time only when Xcode's iOS runtime must be downloaded.
+
+Private clones work for the active `gh` host (github.com or a GHES host):
+
+* HTTPS remotes use the installed credential helper.
+* `git@<host>:org/repo.git` and `ssh://git@<host>/…` are rewritten to HTTPS.
+
+Non-GitHub remotes are not authenticated. Both machines must be on the same tailnet, and
+its ACLs must allow TCP 6080 to the runner node.
+
+## Development
+
+```bash
+npm test                                  # progress model, settings, identity
+node --check main.js lib/*.js renderer/app.js preload.js
+python3 -m py_compile bin/desktop-server.py
+bash -n bin/vm-provision.sh
+```
+
+Layout: `main.js` (window and IPC), `preload.js` (the only bridge), `lib/` (settings,
+backend, progress, setup, session), `renderer/` (plain HTML/CSS/JS), `bin/desktop-server.py`
+(the VM-side server), `bin/screen-stream.swift` (the capture process) and
+`bin/vm-provision.sh` (Xcode, simulator, Node, Yarn, Git).

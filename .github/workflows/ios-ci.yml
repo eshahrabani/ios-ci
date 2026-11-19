@@ -74,7 +74,7 @@ jobs:
       # running behind it. A failed compile is not fatal: the hold step falls back to a
       # screencapture loop, and the self-test uses cliclick for input.
       - name: Prepare the desktop
-        timeout-minutes: 10
+        timeout-minutes: 30
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
           RUN_ID: ${{ github.run_id }}
@@ -121,6 +121,19 @@ jobs:
           fi
 
           PREFIX=$(brew --prefix)
+
+          # Xcode, the iOS runtime, the simulator, Node, Yarn 4 and Git: provisioning
+          # runs in the background so it overlaps the Tailscale daemon and login work.
+          # It starts after the last Homebrew install in this step, never beside one.
+          if ! curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/vm-provision.sh" \
+              -o "$RUNNER_TEMP/vm-provision.sh"; then
+            echo "could not fetch bin/vm-provision.sh from ${SERVER_SHA:0:7}"
+            exit 1
+          fi
+          chmod +x "$RUNNER_TEMP/vm-provision.sh"
+          "$RUNNER_TEMP/vm-provision.sh" "$LOGS/vm-provision.log" &
+          PROVISION_PID=$!
+          echo "provisioning Xcode, the iOS simulator, Node, Yarn 4 and Git in the background"
           TS=$(command -v tailscale || true)
           [[ -n "$TS" ]] || TS="$PREFIX/bin/tailscale"
           if [[ ! -x "$TS" ]]; then
@@ -176,6 +189,18 @@ jobs:
           elif [[ ! -x "$STREAM" ]]; then
             echo "warning: no screen streamer; using a screencapture loop"
           fi
+
+          # The desktop server starts only after every tool the app promises exists.
+          set +e
+          wait "$PROVISION_PID"
+          PROVISION_STATUS=$?
+          set -e
+          if [[ "$PROVISION_STATUS" != "0" ]]; then
+            tail -60 "$LOGS/vm-provision.log" 2>/dev/null || true
+            echo "VM provisioning failed (status $PROVISION_STATUS)"
+            exit 1
+          fi
+          echo "VM provisioning finished"
 
       # This step is the session: it opens the desktop, proves frames and input work,
       # and then holds the VM for the requested minutes. Captures run from this shell

@@ -1,0 +1,13 @@
+{
+  "name": "ios-ci",
+  "version": "2.0.0",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": { "tar": "7.5.23" },
+  "devDependencies": { "electron": "45.4.1" },
+  "engines": { "node": ">=22.12.0" }
+}

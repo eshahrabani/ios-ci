@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; frame-src http://*:6080; connect-src 'self' http://*:6080">
+  <title>ios-ci</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app" id="app">
+    <aside class="rail" id="rail">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">&gt;_</span>
+        <span class="brand-text">
+          <span class="wordmark">ios-ci</span>
+          <span class="sublabel">macOS sessions</span>
+        </span>
+      </div>
+      <nav class="nav" aria-label="Views">
+        <button class="nav-item" data-view="session" title="Session">
+          <span class="nav-icon" data-icon="play" aria-hidden="true"></span><span class="nav-label">Session</span>
+        </button>
+        <button class="nav-item" data-view="desktop" title="Desktop">
+          <span class="nav-icon" data-icon="monitor" aria-hidden="true"></span><span class="nav-label">Desktop</span>
+        </button>
+        <button class="nav-item" data-view="history" title="History">
+          <span class="nav-icon" data-icon="clock" aria-hidden="true"></span><span class="nav-label">History</span>
+        </button>
+        <button class="nav-item" data-view="settings" title="Settings">
+          <span class="nav-icon" data-icon="sliders" aria-hidden="true"></span><span class="nav-label">Settings</span>
+        </button>
+      </nav>
+      <div class="rail-foot">
+        <button class="setup-pill" id="rail-setup">
+          <span class="dot" aria-hidden="true"></span>
+          <span id="rail-setup-text">Checking…</span>
+        </button>
+        <div class="rail-repo mono" id="rail-repo"></div>
+        <div class="rail-login" id="rail-login"></div>
+        <div class="rail-version" id="rail-version"></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="app-header">
+        <h1 id="page-title">Session</h1>
+        <div class="header-right">
+          <span class="status-pill" id="header-status">
+            <span class="dot" aria-hidden="true"></span><span id="header-status-text">Idle</span>
+          </span>
+          <span class="header-timer mono" id="header-timer"></span>
+          <button class="btn ghost small" id="header-open" hidden>Open desktop</button>
+          <button class="btn ghost small" id="header-setup">Setup</button>
+        </div>
+      </header>
+
+      <div class="content" id="content">
+        <section class="view" id="view-session" data-view="session">
+          <div class="loading-state" id="session-loading">
+            <span class="brand-mark large" aria-hidden="true">&gt;_</span>
+            <span class="spinner" aria-hidden="true"></span>
+            <p>Checking your setup…</p>
+          </div>
+
+          <div class="wizard" id="wizard" hidden>
+            <div class="wizard-head">
+              <div>
+                <p class="eyebrow">ONE-TIME SETUP</p>
+                <h2 class="page-title">Set up ios-ci</h2>
+                <p class="page-sub">A few one-time items. Most can be fixed automatically.</p>
+              </div>
+              <div class="wizard-actions">
+                <button class="btn primary" id="wizard-fix">
+                  <span data-icon="wand" aria-hidden="true"></span><span>Fix what I can</span>
+                </button>
+                <button class="btn ghost" id="wizard-recheck">Re-check</button>
+                <button class="btn ghost" id="wizard-done" hidden>Done</button>
+              </div>
+            </div>
+
+            <div class="check-progress">
+              <div class="check-progress-head">
+                <span id="check-count">Checking…</span>
+              </div>
+              <div class="segments" id="check-segments" aria-hidden="true"></div>
+            </div>
+
+            <p class="wizard-success" id="wizard-success" hidden>
+              <span data-icon="check" aria-hidden="true"></span>Everything is ready.
+            </p>
+
+            <div class="check-list" id="check-list"></div>
+
+            <p class="trust-line">Credentials go only to the VM, over your tailnet.</p>
+
+            <div class="setup-log-wrap">
+              <button class="btn ghost small" id="setup-log-toggle" aria-expanded="false">
+                Show details
+              </button>
+              <pre class="setup-log mono" id="setup-log" hidden></pre>
+            </div>
+          </div>
+
+          <div class="session-main" id="session-main" hidden>
+            <div class="hero">
+              <p class="eyebrow">MACOS · IOS</p>
+              <h2 class="page-title hero-title">Start a macOS session</h2>
+              <p class="page-sub">Xcode, an iOS simulator, Node, Yarn 4 and your Git credentials are ready when it appears.</p>
+            </div>
+
+            <div class="ready-banner" id="ready-banner" hidden>
+              <span class="banner-icon" data-icon="check" aria-hidden="true"></span>
+              <div class="banner-text">
+                <strong>Desktop ready</strong>
+                <span>Git credentials are configured.</span>
+              </div>
+              <button class="btn primary" id="banner-open">Open desktop</button>
+            </div>
+
+            <div class="card start-card" id="start-card">
+              <div class="duration" id="duration" role="radiogroup" aria-label="Session length">
+                <button class="duration-pill" role="radio" aria-checked="false" data-minutes="15">15m</button>
+                <button class="duration-pill" role="radio" aria-checked="true" data-minutes="30">30m</button>
+                <button class="duration-pill" role="radio" aria-checked="false" data-minutes="60">60m</button>
+                <button class="duration-pill" role="radio" aria-checked="false" data-minutes="120">120m</button>
+                <button class="duration-pill" role="radio" aria-checked="false" data-custom="true">Custom</button>
+              </div>
+              <div class="custom-minutes" id="custom-minutes" hidden>
+                <label for="custom-minutes-input">Minutes</label>
+                <input id="custom-minutes-input" type="number" min="1" max="300" inputmode="numeric" value="45">
+              </div>
+
+              <div class="start-footer">
+                <span class="footer-repo mono" id="start-repo"></span>
+                <button class="btn primary large" id="start-button">
+                  <span class="btn-label">Start session</span>
+                  <span data-icon="arrow-right" aria-hidden="true"></span>
+                </button>
+              </div>
+              <p class="field-note error-text" id="start-error" hidden></p>
+
+              <details class="copy-disclosure" id="copy-details">
+                <summary>Copy a local folder (optional)</summary>
+                <div class="copy-fields">
+                  <div class="field">
+                    <label for="copy-dir">Folder</label>
+                    <div class="input-row">
+                      <input id="copy-dir" type="text" spellcheck="false" placeholder="Choose a folder…">
+                      <button class="btn secondary" id="copy-browse">Browse…</button>
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="copy-name">Target name in the VM</label>
+                    <input id="copy-name" type="text" spellcheck="false" placeholder="project">
+                  </div>
+                  <label class="checkbox-line">
+                    <input type="checkbox" id="copy-excludes" checked>
+                    <span>Exclude .git, node_modules, build, DerivedData, Pods, .gradle</span>
+                  </label>
+                  <div class="copy-row">
+                    <button class="btn secondary" id="copy-now">Copy now</button>
+                    <span class="muted small" id="copy-status"></span>
+                  </div>
+                  <div class="upload-bar" id="copy-progress" hidden>
+                    <div class="upload-fill" id="copy-progress-fill"></div>
+                  </div>
+                </div>
+              </details>
+            </div>
+
+            <ul class="inclusions" id="inclusions" aria-label="Included in every session">
+              <li><span data-icon="check" aria-hidden="true"></span>Xcode + iOS Simulator</li>
+              <li><span data-icon="check" aria-hidden="true"></span>Node.js</li>
+              <li><span data-icon="check" aria-hidden="true"></span>Yarn 4</li>
+              <li><span data-icon="key" aria-hidden="true"></span>Git credentials</li>
+            </ul>
+
+            <div class="card session-card" id="session-card" hidden>
+              <div class="session-card-head">
+                <span class="status-pill" id="session-status">
+                  <span class="dot" aria-hidden="true"></span><span id="session-status-text">Starting</span>
+                </span>
+                <span class="run-id mono" id="session-run"></span>
+                <button class="btn danger-ghost small" id="session-cancel">Cancel</button>
+              </div>
+              <h3 class="phase-heading" id="session-phase" aria-live="polite"></h3>
+              <p class="session-meta" id="session-meta"></p>
+              <div class="progress" id="session-progress" role="progressbar"
+                   aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-valuetext="Starting">
+                <div class="progress-fill" id="session-progress-fill"></div>
+                <span class="progress-percent mono" id="session-percent">0%</span>
+              </div>
+              <ol class="timeline" id="session-timeline"></ol>
+              <div class="chips" id="session-chips"></div>
+              <p class="git-line" id="session-git"></p>
+              <div class="inline-error" id="session-error" hidden>
+                <p id="session-error-text"></p>
+                <div class="error-actions">
+                  <button class="btn secondary small" id="error-run">Open run on GitHub</button>
+                  <button class="btn secondary small" id="error-retry">Retry</button>
+                  <button class="btn ghost small" id="error-setup">Re-check setup</button>
+                </div>
+              </div>
+              <div class="upload-line" id="session-upload" hidden>
+                <div class="upload-track"><div class="upload-fill" id="session-upload-fill"></div></div>
+                <span class="muted small" id="session-upload-text"></span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-desktop" data-view="desktop" hidden>
+          <div class="desktop-shell">
+            <div class="desktop-toolbar">
+              <span class="status-pill" id="desktop-live">
+                <span class="dot" aria-hidden="true"></span><span id="desktop-live-text">Live</span>
+              </span>
+              <span class="desktop-time" id="desktop-time"></span>
+              <span class="run-id mono" id="desktop-run"></span>
+              <div class="toolbar-spacer"></div>
+              <button class="btn ghost small" id="desktop-fullscreen" title="Fullscreen">
+                <span data-icon="expand" aria-hidden="true"></span><span>Fullscreen</span>
+              </button>
+              <button class="btn ghost small" id="desktop-external" title="Open in browser">
+                <span data-icon="external" aria-hidden="true"></span><span>Open in browser</span>
+              </button>
+              <button class="btn ghost small" id="desktop-copy" title="Copy URL">
+                <span data-icon="copy" aria-hidden="true"></span><span>Copy URL</span>
+              </button>
+              <button class="btn danger-ghost small" id="desktop-stop" title="Stop session">
+                <span data-icon="stop" aria-hidden="true"></span><span>Stop</span>
+              </button>
+            </div>
+            <div class="desktop-stage" id="desktop-stage">
+              <div class="desktop-empty" id="desktop-empty">
+                <svg viewBox="0 0 120 90" width="120" height="90" aria-hidden="true"
+                     fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+                  <rect x="12" y="10" width="96" height="58" rx="5"></rect>
+                  <path d="M48 78h24M60 68v10"></path>
+                </svg>
+                <h2>No desktop yet</h2>
+                <p>Start a session or open one from History.</p>
+                <button class="btn primary" id="desktop-start">Start a session</button>
+              </div>
+              <div class="desktop-loading" id="desktop-loading" hidden>
+                <span class="spinner" aria-hidden="true"></span>
+                <p>Connecting to your Mac…</p>
+                <button class="btn secondary" id="desktop-retry" hidden>Retry</button>
+              </div>
+              <div class="desktop-error inline-error" id="desktop-error" hidden>
+                <p id="desktop-error-text"></p>
+                <button class="btn secondary" id="desktop-error-retry">Retry</button>
+              </div>
+              <webview id="desktop-webview" partition="ios-ci" hidden></webview>
+              <div class="desktop-hint" id="desktop-hint" hidden>Click the screen to control the Mac.</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view" id="view-history" data-view="history" hidden>
+          <div class="page-head">
+            <h2 class="page-title">Sessions</h2>
+            <p class="page-sub">Recent macOS sessions.</p>
+          </div>
+          <div class="inline-error" id="history-error" hidden>
+            <p id="history-error-text"></p>
+            <button class="btn secondary small" id="history-retry">Retry</button>
+          </div>
+          <div id="history-groups">
+            <div class="history-group" id="history-active-group" hidden>
+              <h3 class="group-title">Active</h3>
+              <div class="session-rows" id="history-active-rows"></div>
+            </div>
+            <div class="history-group" id="history-earlier-group" hidden>
+              <h3 class="group-title">Earlier</h3>
+              <div class="session-rows" id="history-earlier-rows"></div>
+            </div>
+          </div>
+          <div class="empty-state" id="history-empty" hidden>
+            <svg viewBox="0 0 96 96" width="96" height="96" aria-hidden="true"
+                 fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+              <circle cx="48" cy="48" r="34"></circle>
+              <path d="M48 30v20l13 8"></path>
+            </svg>
+            <h2>No sessions yet</h2>
+            <button class="btn primary" id="history-start">Start a session</button>
+          </div>
+        </section>
+
+        <section class="view" id="view-settings" data-view="settings" hidden>
+          <div class="page-head">
+            <h2 class="page-title">Settings</h2>
+            <p class="page-sub">One-time values and where sessions run.</p>
+          </div>
+
+          <div class="card settings-card">
+            <h3>Runner</h3>
+            <p class="helper">The repository with the ios-ci workflow and its secrets.</p>
+            <div class="field">
+              <label for="settings-repo">Repository</label>
+              <input id="settings-repo" type="text" spellcheck="false" placeholder="owner/repo">
+              <p class="field-note error-text" id="settings-repo-note" hidden></p>
+            </div>
+          </div>
+
+          <div class="card settings-card">
+            <h3>Git identity</h3>
+            <p class="helper">Copied into the VM and used for commits.</p>
+            <div class="field">
+              <label for="settings-git-name">Name</label>
+              <input id="settings-git-name" type="text" placeholder="Resolved from git or GitHub">
+            </div>
+            <div class="field">
+              <label for="settings-git-email">Email</label>
+              <input id="settings-git-email" type="text" spellcheck="false" placeholder="Resolved from git or GitHub">
+            </div>
+          </div>
+
+          <div class="card settings-card">
+            <h3>Tailscale</h3>
+            <p class="helper">The VM joins your tailnet with this repository secret.</p>
+            <div class="field">
+              <span class="field-label">Auth key</span>
+              <span class="key-status" id="settings-key-status">Checking…</span>
+              <div class="input-row">
+                <input id="settings-key" type="password" autocomplete="off" spellcheck="false"
+                       placeholder="tskey-auth-…">
+                <button class="btn secondary" id="settings-save-key">Save key</button>
+              </div>
+              <p class="field-note" id="settings-key-note" hidden></p>
+              <button class="link-button" id="settings-create-key">Create a key</button>
+            </div>
+          </div>
+
+          <div class="card settings-card">
+            <h3>Setup</h3>
+            <p class="helper" id="settings-setup-summary">Checking…</p>
+            <div class="button-row">
+              <button class="btn secondary" id="settings-recheck">Re-check</button>
+              <button class="btn ghost" id="settings-open-setup">Open setup</button>
+            </div>
+          </div>
+
+          <div class="card settings-card about-card">
+            <h3>About</h3>
+            <dl class="about-list">
+              <dt>App version</dt><dd class="mono" id="about-version"></dd>
+              <dt>GitHub login</dt><dd id="about-login"></dd>
+              <dt>Runner repo</dt><dd class="mono" id="about-repo"></dd>
+            </dl>
+          </div>
+          <p class="saved-note" id="settings-saved" hidden>Saved</p>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
+</body>
+</html>

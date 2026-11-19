@@ -1,2 +1,0 @@
-# Dependencies of bin/ios-ci-gui.py; bin/ios-ci-gui installs these into a venv.
-PySide6>=6.10,<7

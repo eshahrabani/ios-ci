@@ -31,6 +31,16 @@ on:
         required: false
         default: '0'
         type: string
+      node_version:
+        description: Node.js version installed on the runner
+        required: false
+        default: '22'
+        type: string
+      boot_config:
+        description: JSON applied before a manual desktop opens (xcode, simulator, brew, script)
+        required: false
+        default: '{}'
+        type: string
 
 permissions:
   contents: read
@@ -233,7 +243,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v7
         with:
-          node-version: 22
+          node-version: ${{ inputs.node_version }}
           cache: npm
           cache-dependency-path: app/package-lock.json
 
@@ -341,6 +351,122 @@ jobs:
           xcrun simctl install "$UDID" "$APP_PATH"
           BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP_PATH/Info.plist")
           echo "BUNDLE_ID=$BUNDLE_ID" >> "$GITHUB_ENV"
+
+      # Manual runs start from whatever the image ships. The tester's preferences
+      # (a different Xcode, a simulator with its runtime, brew packages, a setup
+      # script) are applied here, before the desktop opens, so the VM they get is the
+      # one they asked for. Every command here is best effort: a preference that
+      # cannot be satisfied must not cost the session, so failures are recorded in
+      # boot-config.log and reflected in BOOT_STATUS.
+      - name: Apply boot config
+        if: always() && inputs.manual_minutes != '0'
+        timeout-minutes: 25
+        env:
+          BOOT_CONFIG: ${{ inputs.boot_config }}
+        run: |
+          set -uo pipefail
+          LOGS="$RUNNER_TEMP/ci-logs"
+          mkdir -p "$LOGS"
+          exec > >(tee -a "$LOGS/boot-config.log") 2>&1
+          BOOT_STATUS=ok
+          warn() { echo "warning: $*"; BOOT_STATUS=partial; }
+
+          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
+          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
+
+          BOOT_CONFIG="${BOOT_CONFIG:-}"
+          if [[ -z "${BOOT_CONFIG// /}" || "${BOOT_CONFIG// /}" == "{}" ]]; then
+            BOOT_CONFIG='{}'
+            echo "boot config: none"
+          elif ! printf '%s' "$BOOT_CONFIG" | jq -e . >/dev/null 2>&1; then
+            warn "boot_config is not valid JSON; using image defaults"
+            BOOT_CONFIG='{}'
+          else
+            echo "boot config: $BOOT_CONFIG"
+          fi
+
+          XCODE=$(printf '%s' "$BOOT_CONFIG" | jq -r '.xcode // empty')
+          if [[ -n "$XCODE" ]]; then
+            echo "== xcode: $XCODE"
+            ls -d /Applications/Xcode*.app 2>/dev/null || true
+            if [[ -d "$XCODE" ]]; then
+              sudo xcode-select -s "$XCODE" && xcodebuild -version \
+                || warn "could not select $XCODE"
+            else
+              warn "$XCODE is not installed on this image"
+            fi
+          fi
+
+          PLATFORM=$(printf '%s' "$BOOT_CONFIG" | jq -r '.simulator.platform // empty')
+          if [[ -n "$PLATFORM" ]]; then
+            echo "== simulator platform: $PLATFORM"
+            if [[ "$PLATFORM" == "latest" ]]; then
+              xcodebuild -downloadPlatform iOS || warn "downloading the iOS platform failed"
+            else
+              xcodebuild -downloadPlatform iOS -buildVersion "$PLATFORM" \
+                || warn "downloading iOS platform $PLATFORM failed"
+            fi
+            xcrun simctl list runtimes | tail -5 || true
+          fi
+
+          DEVICE=$(printf '%s' "$BOOT_CONFIG" | jq -r '.simulator.device // empty')
+          RUNTIME=$(printf '%s' "$BOOT_CONFIG" | jq -r '.simulator.runtime // empty')
+          if [[ -n "$DEVICE" ]]; then
+            echo "== simulator: $DEVICE (runtime: ${RUNTIME:-any})"
+            UDID=$(xcrun simctl list devices available -j | jq -r \
+              --arg d "$DEVICE" --arg r "$RUNTIME" '
+                [.devices | to_entries[] | .key as $runtime | .value[]
+                 | select(.name == $d)
+                 | select(($r | length) == 0
+                     or (($runtime | ascii_downcase)
+                         | contains($r | ascii_downcase))
+                     or (($runtime | ascii_downcase)
+                         | contains($r | gsub("\\."; "-") | ascii_downcase)))
+                 | {runtime: $runtime, udid: .udid}]
+                | sort_by(.runtime) | last | .udid // empty')
+            if [[ -z "$UDID" ]]; then
+              warn "no available simulator named '$DEVICE'; the image's own choice stays"
+              xcrun simctl list devices available | head -30 || true
+            else
+              echo "booting $DEVICE ($UDID)"
+              xcrun simctl boot "$UDID" 2>/dev/null || true
+              BOOTED=0
+              for _ in $(seq 1 150); do
+                if xcrun simctl list devices | grep -q "($UDID) (Booted)"; then BOOTED=1; break; fi
+                sleep 2
+              done
+              if [[ "$BOOTED" == "1" ]]; then
+                SIMULATOR="$DEVICE"
+                {
+                  echo "SIMULATOR=$DEVICE"
+                  echo "UDID=$UDID"
+                } >> "$GITHUB_ENV"
+                # The Simulator window belongs to the console session, not this shell.
+                sudo launchctl asuser "$CONSOLE_UID" open -a Simulator 2>/dev/null \
+                  || open -a Simulator || warn "could not open the Simulator app"
+              else
+                warn "simulator $UDID did not reach Booted within 300 s"
+              fi
+            fi
+          fi
+
+          for formula in $(printf '%s' "$BOOT_CONFIG" | jq -r '(.brew // [])[]?'); do
+            [[ -n "$formula" ]] || continue
+            echo "== brew install $formula"
+            brew install "$formula" || warn "brew install $formula failed"
+          done
+
+          SETUP_SCRIPT=$(printf '%s' "$BOOT_CONFIG" | jq -r '.script // empty')
+          if [[ -n "$SETUP_SCRIPT" ]]; then
+            echo "== setup script ($(printf '%s\n' "$SETUP_SCRIPT" | wc -l | tr -d ' ') lines)"
+            printf '%s\n' "$SETUP_SCRIPT" > "$RUNNER_TEMP/boot-setup.sh"
+            # APP_DIR points at the cloned app; the script's output lands in this log.
+            bash "$RUNNER_TEMP/boot-setup.sh" || warn "the setup script exited non-zero"
+            echo "== setup script finished"
+          fi
+
+          echo "BOOT_STATUS=$BOOT_STATUS" >> "$GITHUB_ENV"
+          echo "boot config applied: $BOOT_STATUS"
 
       # Manual runs: enable the built-in Screen Sharing server, join the tailnet (the
       # step above), and publish the tailnet address to the private app repo. Runs even
@@ -490,6 +616,11 @@ jobs:
             echo "desktop_url: ${DESKTOP_URL}"
             echo "session_minutes: ${MANUAL_MINUTES}"
             echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+            echo "boot_status: ${BOOT_STATUS:-unknown}"
+            echo "simulator: ${SIMULATOR:-none}"
+            echo "xcode: $(xcode-select -p 2>/dev/null || echo none)"
+            echo "node: $(node --version 2>/dev/null || echo none)"
+            echo "yarn: $(yarn --version 2>/dev/null || echo none)"
           } > "$LOGS/manual-ready.txt"
 
           KEY="$RUNNER_TEMP/manual_key"
@@ -497,19 +628,44 @@ jobs:
           printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
           chmod 600 "$KEY"
           export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$RUNNER_TEMP/manual_known_hosts"
+          REMOTE="git@github.com:${APP_REPO}.git"
           TMP="$RUNNER_TEMP/manual-publish"
           rm -rf "$TMP"
-          mkdir -p "$TMP/ci-logs"
-          cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
-          cp "$LOGS/vnc-step.log" "$TMP/ci-logs/vnc-step.log"
-          cp "$LOGS"/desktop.png "$TMP/ci-logs/" 2>/dev/null || true
+          mkdir -p "$TMP"
           git -C "$TMP" init -q
           git -C "$TMP" config user.name ios-ci
           git -C "$TMP" config user.email ios-ci@users.noreply.github.com
-          git -C "$TMP" add ci-logs/manual-ready.txt ci-logs/vnc-step.log
-          git -C "$TMP" add ci-logs/desktop.png 2>/dev/null || true
-          git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
-          git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs
+
+          # Publish on top of the current ci-logs branch instead of force-pushing a
+          # single commit, so a concurrent manual session keeps its
+          # ci-logs/sessions/<run_id>/ address. The shared ci-logs/manual-ready.txt
+          # still points at the newest session, which is what bin/ios-ci.sh reads.
+          publish_ready() {
+            if git -C "$TMP" fetch -q "$REMOTE" ci-logs 2>/dev/null; then
+              git -C "$TMP" reset -q --hard FETCH_HEAD
+            fi
+            mkdir -p "$TMP/ci-logs/sessions/${RUN_ID}"
+            cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/manual-ready.txt"
+            cp "$LOGS/vnc-step.log" "$TMP/ci-logs/vnc-step.log"
+            cp "$LOGS"/desktop.png "$TMP/ci-logs/" 2>/dev/null || true
+            cp "$LOGS/manual-ready.txt" "$TMP/ci-logs/sessions/${RUN_ID}/manual-ready.txt"
+            cp "$LOGS/boot-config.log" "$TMP/ci-logs/sessions/${RUN_ID}/" 2>/dev/null || true
+            cp "$LOGS"/desktop.png "$TMP/ci-logs/sessions/${RUN_ID}/" 2>/dev/null || true
+            git -C "$TMP" add ci-logs
+            git -C "$TMP" diff --cached --quiet && return 0
+            git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
+            git -C "$TMP" push -q "$REMOTE" HEAD:refs/heads/ci-logs
+          }
+          pushed=0
+          for attempt in 1 2 3; do
+            if publish_ready; then pushed=1; break; fi
+            echo "publish attempt ${attempt} lost a race with another session; retrying"
+            sleep 2
+          done
+          if [[ "$pushed" != "1" ]]; then
+            echo "warning: could not fast-forward ci-logs; forcing the session address"
+            git -C "$TMP" push -q --force "$REMOTE" HEAD:refs/heads/ci-logs
+          fi
           echo "DESKTOP_READY=1" >> "$GITHUB_ENV"
           echo "DESKTOP_URL=${DESKTOP_URL}" >> "$GITHUB_ENV"
           echo "desktop ready; url published to the private ci-logs branch"
@@ -827,6 +983,19 @@ jobs:
           git rm -rf . >/dev/null 2>&1 || true
           mkdir -p ci-logs
           cp -R "$LOGS"/. ci-logs/ 2>/dev/null || true
+          # This step replaces the whole branch, and a manual session may still be
+          # running: carry its ci-logs/sessions/<run_id>/ address over, and keep the
+          # newest 20 so the branch does not grow with every session.
+          if git fetch -q "git@github.com:${APP_REPO}.git" ci-logs 2>/dev/null; then
+            git checkout FETCH_HEAD -- ci-logs/sessions 2>/dev/null || true
+            total=$(ls -1 ci-logs/sessions 2>/dev/null | wc -l | tr -d ' ')
+            drop=$((total - 20))
+            if (( drop > 0 )); then
+              ls -1 ci-logs/sessions | sort -n | sed -n "1,${drop}p" | while IFS= read -r old; do
+                rm -rf "ci-logs/sessions/$old"
+              done
+            fi
+          fi
           # A branch-root README renders the run's screenshots inline and links the
           # recording, so viewing a headless run is one click instead of a file hunt.
           {

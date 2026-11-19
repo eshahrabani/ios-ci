@@ -15,6 +15,9 @@ JSON. The writer always sends the newest frame and the page drops a frame if it 
 painting the previous one, so a slow link shows the present instead of a backlog. Input
 is fire-and-forget: TCP keeps the order, and a keystroke costs one one-way trip, not a
 request/response round trip per character.
+
+Uploads go the other way: POST /upload?t=<token>&name=<dir> stores a tar.gz in the
+tester's home, so a directory from their machine appears inside the session.
 """
 import base64
 import collections
@@ -22,11 +25,14 @@ import hashlib
 import http.server
 import json
 import os
+import pwd
+import re
 import shutil
 import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -37,6 +43,9 @@ BIND = sys.argv[3] if len(sys.argv) > 3 else "0.0.0.0"
 FRAME = "/tmp/desktop-frame.jpg"
 BEAT = FRAME + ".beat"                  # touched every second by the capture process
 STAT = FRAME + ".stat"                  # capture counters written by the same process
+UPLOAD_MAX = 4 * 1024 ** 3              # refuse anything larger: 4 GiB of tar.gz
+UPLOAD_CHUNK = 1024 * 1024
+UPLOAD_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 INPUT_PORT = int(os.environ.get("INPUT_PORT", "7777"))
 INPUT_SOCKET = [None]                   # connection to the capture process's input agent
 INPUT_QUEUE = collections.deque()       # one ordered queue: keystrokes must not reorder
@@ -84,6 +93,61 @@ def run(cmd):
         return subprocess.run(cmd, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(cmd, 1, "", "")
+
+
+def home_dir():
+    """The tester's home directory, where uploads land.
+
+    The server starts under `sudo launchctl asuser`, and sudo keeps HOME=/var/root in
+    some configurations; resolving the account's home from the uid keeps files where
+    the console user's Finder and Terminal look for them.
+    """
+    configured = os.environ.get("IOS_CI_UPLOAD_HOME")
+    if configured:
+        return configured
+    try:
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except KeyError:
+        return os.path.expanduser("~")
+
+
+def archive_problem(path):
+    """Why this tar.gz cannot be extracted safely, or "" when it is fine."""
+    try:
+        listing = subprocess.run(["tar", "-tzf", path], capture_output=True,
+                                 text=True, timeout=120)
+        verbose = subprocess.run(["tar", "-tvzf", path], capture_output=True,
+                                 text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"could not read the archive: {error}"
+    if listing.returncode or verbose.returncode:
+        return "the upload is not a tar.gz"
+    for member in listing.stdout.splitlines():
+        if not member:
+            continue
+        if member.startswith("/") or ".." in member.replace("\\", "/").split("/"):
+            return f"unsafe member: {member[:120]}"
+    for line in verbose.stdout.splitlines():
+        # bsdtar/GNU both render a link as "name -> target".
+        if " -> " not in line:
+            continue
+        target = line.split(" -> ", 1)[1].strip()
+        if target.startswith("/") or ".." in target.split("/"):
+            return f"unsafe link target: {target[:120]}"
+    return ""
+
+
+def tree_size(root):
+    files = 0
+    size = 0
+    for base, _dirs, names in os.walk(root):
+        for entry in names:
+            files += 1
+            try:
+                size += os.lstat(os.path.join(base, entry)).st_size
+            except OSError:
+                pass
+    return files, size
 
 
 def osa(script):
@@ -867,6 +931,71 @@ class Handler(http.server.BaseHTTPRequestHandler):
             enqueue({"t": "key", "code": code})
             return self.send(f"key {name}")
         return self.send("not found", status=404)
+
+    def receive(self, path, length):
+        """Stream the request body into path; False when it ends early."""
+        left = length
+        with open(path, "wb") as out:
+            while left > 0:
+                chunk = self.rfile.read(min(UPLOAD_CHUNK, left))
+                if not chunk:
+                    return False
+                out.write(chunk)
+                left -= len(chunk)
+        return True
+
+    def do_POST(self):
+        url = urllib.parse.urlparse(self.path)
+        query = urllib.parse.parse_qs(url.query)
+        if query.get("t", [""])[0] != TOKEN:
+            return self.send("forbidden", status=403)
+        if url.path != "/upload":
+            return self.send("not found", status=404)
+        name = query.get("name", [""])[0]
+        if not UPLOAD_NAME.fullmatch(name) or name in (".", ".."):
+            return self.send("bad upload name", status=400)
+        try:
+            length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return self.send("Content-Length required", status=400)
+        if not 1 <= length <= UPLOAD_MAX:
+            return self.send("upload must be 1 byte to 4 GiB", status=400)
+        home = home_dir()
+        archive = tempfile.NamedTemporaryFile(prefix="ios-ci-upload-", suffix=".tar.gz",
+                                              delete=False).name
+        staging = ""
+        try:
+            if not self.receive(archive, length):
+                return self.send("the upload ended early", status=400)
+            problem = archive_problem(archive)
+            if problem:
+                return self.send(problem, status=400)
+            # Staging lives beside the target so the move below stays on one volume.
+            staging = tempfile.mkdtemp(prefix=".upload-", dir=home)
+            extracted = subprocess.run(["tar", "-xzf", archive, "-C", staging],
+                                       capture_output=True, text=True, timeout=600)
+            if extracted.returncode:
+                return self.send("could not extract the archive: "
+                                 + extracted.stderr.strip()[:200], status=400)
+            files, size = tree_size(staging)
+            target = os.path.join(home, name)
+            if os.path.isdir(target) and not os.path.islink(target):
+                shutil.rmtree(target)
+            elif os.path.exists(target) or os.path.islink(target):
+                os.remove(target)
+            os.replace(staging, target)
+            staging = ""
+            return self.send(json.dumps({"path": target, "files": files, "bytes": size}),
+                             kind="application/json")
+        except (OSError, subprocess.SubprocessError) as error:
+            return self.send(f"upload failed: {error}", status=500)
+        finally:
+            try:
+                os.unlink(archive)
+            except OSError:
+                pass
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
 
 
 def main():

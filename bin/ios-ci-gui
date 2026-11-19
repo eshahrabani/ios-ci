@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# ios-ci-gui — start the desktop app for manual macOS sessions.
+#
+# PySide6 is the only dependency. It goes into a venv under the user cache so the
+# system Python stays untouched; the first run creates it and installs the wheel
+# (about a minute), later runs exec straight into it.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ios-ci-gui"
+VENV="$CACHE/venv"
+
+PYTHON=""
+for candidate in python3.13 python3.12 python3; do
+  if command -v "$candidate" >/dev/null 2>&1; then
+    PYTHON=$(command -v "$candidate")
+    break
+  fi
+done
+if [[ -z "$PYTHON" ]]; then
+  echo "error: python3 is required" >&2
+  exit 1
+fi
+
+if [[ ! -x "$VENV/bin/python" ]]; then
+  echo "creating $VENV with $("$PYTHON" --version 2>&1)" >&2
+  if ! "$PYTHON" -m venv "$VENV"; then
+    echo "error: could not create $VENV (python3-venv / ensurepip missing?)" >&2
+    exit 1
+  fi
+fi
+
+if ! "$VENV/bin/python" -c 'import PySide6' >/dev/null 2>&1; then
+  echo "installing PySide6 into $VENV (one time)" >&2
+  if ! "$VENV/bin/python" -m pip install -q -r "$HERE/requirements-gui.txt"; then
+    echo "error: pip could not install PySide6; retry by hand with:" >&2
+    echo "  uv venv --python 3.13 \"$VENV\" && uv pip install --python \"$VENV/bin/python\" PySide6" >&2
+    exit 1
+  fi
+fi
+
+exec "$VENV/bin/python" "$HERE/ios-ci-gui.py" "$@"

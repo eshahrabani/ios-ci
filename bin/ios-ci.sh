@@ -271,12 +271,12 @@ cmd_run() {
   if [[ "$MANUAL_MINUTES" != "0" ]]; then
     local secret_names
     if secret_names=$(gh secret list --repo "$RUNNER_REPO" --json name --jq '.[].name' 2>/dev/null); then
-      for s in TAILSCALE_AUTH_KEY VNC_USER_PASSWORD; do
+      for s in TAILSCALE_AUTH_KEY; do
         grep -qx "$s" <<<"$secret_names" || die "missing secret $s on $RUNNER_REPO.
      set it with: gh secret set $s --repo $RUNNER_REPO"
       done
     else
-      warn "could not list secrets on $RUNNER_REPO; ensure TAILSCALE_AUTH_KEY, VNC_PASSWORD and VNC_USER_PASSWORD are set"
+      warn "could not list secrets on $RUNNER_REPO; ensure TAILSCALE_AUTH_KEY is set"
     fi
   fi
   local baseline_id

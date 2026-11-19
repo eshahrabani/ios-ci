@@ -238,6 +238,7 @@ jobs:
           cache-dependency-path: app/package-lock.json
 
       - name: Install web dependencies
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 15
         run: |
@@ -250,6 +251,7 @@ jobs:
           }
 
       - name: Build web assets
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 15
         run: |
@@ -261,6 +263,7 @@ jobs:
           }
 
       - name: Sync Capacitor iOS project
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 10
         run: |
@@ -273,6 +276,7 @@ jobs:
           }
 
       - name: Build for iOS Simulator
+        if: inputs.manual_minutes == '0'
         working-directory: app
         timeout-minutes: 20
         run: |
@@ -296,6 +300,7 @@ jobs:
             }
 
       - name: Boot simulator and install app
+        if: inputs.manual_minutes == '0'
         id: boot
         working-directory: app
         timeout-minutes: 10
@@ -375,8 +380,7 @@ jobs:
           echo "console user: ${CONSOLE_USER}"
 
           # Evidence that the desk exists, published with the address.
-          sudo launchctl asuser "$CONSOLE_UID" screencapture -C -x "$LOGS/desktop.png" 2>&1 \
-            || sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop.png" 2>&1 || true
+          screencapture -x "$LOGS/desktop.png" 2>&1 || true
 
           # Input needs real CGEvents: System Events' position clicks are no-ops.
           brew install cliclick 2>&1 | tail -2 || true
@@ -413,13 +417,15 @@ jobs:
           # Root captures outside the per-user consent path. Capturing as the console
           # user makes macOS ask for persistent screen access with a modal dialog that
           # ignores synthetic clicks, which freezes every later click and key.
-          # The simulator's own framebuffer needs no screen-recording consent, and the
-          # app under test is what the tester works with.
-          xcrun simctl boot "$UDID" 2>/dev/null || true
-          open -a Simulator --args -CurrentDeviceUDID "$UDID" 2>/dev/null || true
+          # Capture from this shell, not through `launchctl asuser`: the console
+          # session is a different TCC responsibility chain without the image's
+          # screen-capture grant, and that is what raises the modal prompt
+          # ("bash is requesting to bypass the system private window picker") that
+          # then swallows every click. Measured: the same shell captures silently.
+          rm -f /tmp/desktop-frame.png
           (
             while true; do
-              xcrun simctl io "$UDID" screenshot /tmp/desktop-frame.png >/dev/null 2>&1
+              screencapture -x -t png /tmp/desktop-frame.png 2>/dev/null
               chmod 644 /tmp/desktop-frame.png 2>/dev/null
               sleep 1
             done
@@ -603,10 +609,6 @@ jobs:
           set -euo pipefail
           LOGS="$RUNNER_TEMP/ci-logs"
           mkdir -p "$LOGS"
-          if [[ -n "${APP_PATH:-}" && -n "${UDID:-}" && -n "${BUNDLE_ID:-}" ]]; then
-            xcrun simctl install "$UDID" "$APP_PATH" 2>/dev/null || true
-            xcrun simctl launch "$UDID" "$BUNDLE_ID" 2>/dev/null || true
-          fi
           if [[ "${DESKTOP_READY:-0}" != "1" ]]; then
             echo "the desktop was not enabled; skipping the manual hold"
             exit 0

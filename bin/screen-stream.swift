@@ -39,6 +39,7 @@ let statPath = outPath + ".stat"
 
 var displayWidth = 0
 var displayHeight = 0
+var lastAdjust = 0.0
 
 func jpegData(_ buffer: CVPixelBuffer, quality: Double) -> Data? {
     CVPixelBufferLockBaseAddress(buffer, .readOnly)
@@ -166,6 +167,7 @@ func startStream() {
             sink.onSlow = {
                 guard maxWidth > 640 else { return }
                 maxWidth = max(640, maxWidth * 3 / 4)
+                lastAdjust = Date().timeIntervalSince1970
                 err("capture is slow; dropping to max width \(maxWidth)")
                 DispatchQueue.main.async { startStream() }
             }
@@ -397,6 +399,14 @@ func writeStat() {
         }
         sink.reportAt = now
         sink.reportEncoded = encoded
+        // Restore resolution once the heavy window is gone, at most every 10 s.
+        if sink.encodeMS > 0, sink.encodeMS < 8, maxWidth < 1280,
+           now - lastAdjust > 10 {
+            maxWidth = min(1280, maxWidth * 5 / 4)
+            lastAdjust = now
+            err("capture is fast again; raising max width to \(maxWidth)")
+            DispatchQueue.main.async { startStream() }
+        }
     }
     let stat: [String: Any] = ["fps": (fps * 10).rounded() / 10,
                                "encoded": encoded, "delivered": delivered,

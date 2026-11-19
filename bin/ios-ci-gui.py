@@ -449,8 +449,8 @@ class Backend:
 class Worker(QThread):
     """One background job; functions receive report(sent, total) for progress."""
 
-    # Not `finished`: QThread already defines that signal, and shadowing it in a
-    # subclass leaves run() unconnected to the slots below.
+    # Not `finished`: that is QThread's own thread-finished signal, which says
+    # nothing about a successful result or its value.
     result = Signal(object)
     failed = Signal(str)
     progress = Signal(int, int)

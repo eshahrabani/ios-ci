@@ -632,6 +632,13 @@ jobs:
           # Capture for the whole hold: only this job's own shell carries the image's
           # screen-capture grant, and a job started from a step dies with that step.
           rm -f /tmp/desktop-frame.png
+          # The assertion has to live in the console session: started from this step it
+          # does not stop the display from blanking, and `screencapture` then blocks on
+          # the sleeping display (frames minutes apart).
+          CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
+          CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
+          sudo launchctl asuser "$CONSOLE_UID" /usr/bin/caffeinate -d -i -m -s -u \
+            -t $(( 10#${MANUAL_MINUTES} * 60 + 600 )) 2>/dev/null &
           (
             set +e                     # one failed capture must not end the stream
             while true; do

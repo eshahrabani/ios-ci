@@ -386,12 +386,27 @@ jobs:
           brew install cliclick 2>&1 | tail -2 || true
           CLICLICK=$(command -v cliclick || echo /opt/homebrew/bin/cliclick)
           echo "cliclick: ${CLICLICK}"
+
+          # `screencapture` costs ~0.15 s per call and caps a capture loop near 6 fps.
+          # This streams compositor frames instead (25+ fps measured on this image).
+          # Built from the running commit so the binary matches the server, and built
+          # here because the hold step needs it already present. A failure is not fatal:
+          # the hold step falls back to the screencapture loop.
+          STREAM="$RUNNER_TEMP/screen-stream"
+          if curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/screen-stream.swift" \
+              -o "$RUNNER_TEMP/screen-stream.swift"; then
+            if xcrun swiftc -O -swift-version 5 -o "$STREAM" "$RUNNER_TEMP/screen-stream.swift" 2>&1 | tail -5; then
+              echo "streamer built: ${STREAM}"
+            else
+              echo "warning: could not build the screen streamer; the hold will use screencapture"
+            fi
+          fi
           # Accessibility and capture for the injected events, in BOTH databases: the
           # console session consults its own user database, and a grant only in the
           # system one leaves events dropped after the consent prompt times out.
           USER_TCC="/Users/${CONSOLE_USER}/Library/Application Support/com.apple.TCC/TCC.db"
           for db in "/Library/Application Support/com.apple.TCC/TCC.db" "$USER_TCC"; do
-            for client in "/usr/bin/python3" "$CLICLICK" "/bin/bash" "/usr/bin/osascript"; do
+            for client in "/usr/bin/python3" "$CLICLICK" "/bin/bash" "/usr/bin/osascript" "$STREAM"; do
               for service in kTCCServiceAccessibility kTCCServiceScreenCapture; do
                 sudo sqlite3 "$db" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('$service','$client',1,2,0,1,0)" 2>&1 | head -1 || true
               done
@@ -655,11 +670,43 @@ jobs:
           } > "$LOGS/manual-session.txt"
           echo "Manual session open for ${MANUAL_MINUTES} minutes; build ${APP_DIR:-the app} in Xcode."
           caffeinate -d -i -m -s -u -t $(( 10#${MANUAL_MINUTES} * 60 + 300 )) &
-          # Capture in the foreground: a loop inside a background subshell is napped
-          # to about one frame a second, while the same loop from the step's own shell
-          # runs at the capture cost (~4 fps). The deadline does the holding.
+          # ScreenCaptureKit streams compositor frames to FRAME; it has to start from
+          # this step's shell for the same reason the capture below does (the console
+          # session is a different TCC chain without the image's grant).
+          STREAM="$RUNNER_TEMP/screen-stream"
+          STREAM_PID=""
+          if [[ -x "$STREAM" ]]; then
+            "$STREAM" "$FRAME" 30 0.55 1280 >/dev/null 2>"$LOGS/screen-stream.log" &
+            STREAM_PID=$!
+            for _ in $(seq 1 20); do
+              sleep 0.5
+              [[ -s "$FRAME" ]] && break
+            done
+            if [[ ! -s "$FRAME" ]]; then
+              echo "the screen streamer produced no frame; falling back to screencapture"
+              kill "$STREAM_PID" 2>/dev/null || true
+              wait "$STREAM_PID" 2>/dev/null || true
+              STREAM_PID=""
+              tail -20 "$LOGS/screen-stream.log" 2>/dev/null || true
+            else
+              echo "screen stream: $(head -1 "$LOGS/screen-stream.log" 2>/dev/null)"
+            fi
+          fi
           END=$(( $(date +%s) + 10#${MANUAL_MINUTES} * 60 ))
-          set +e                       # one failed capture must not end the stream
+          set +e                       # a dead streamer must not end the hold
+          if [[ -n "$STREAM_PID" ]]; then
+            while (( $(date +%s) < END )) && kill -0 "$STREAM_PID" 2>/dev/null; do
+              sleep 1
+            done
+            kill "$STREAM_PID" 2>/dev/null
+            wait "$STREAM_PID" 2>/dev/null
+            (( $(date +%s) >= END )) \
+              || echo "the screen streamer exited early; using screencapture for the rest"
+          fi
+          # Fallback capture in the foreground: a loop inside a background subshell is
+          # napped to about one frame a second, while the same loop from the step's own
+          # shell runs at the capture cost (~4 fps). Skipped when the streamer held the
+          # whole session, because the deadline has already passed.
           while (( $(date +%s) < END )); do
             screencapture -x -t jpg "$FRAME.tmp" 2>/dev/null \
               && mv -f "$FRAME.tmp" "$FRAME" 2>/dev/null
@@ -689,6 +736,9 @@ jobs:
             echo
             echo "== listeners"
             sudo lsof -iTCP -sTCP:LISTEN 2>&1 | grep -E '6080|rfb' | head -5
+            echo
+            echo "== screen stream"
+            tail -10 "$LOGS/screen-stream.log" 2>&1
             echo
             echo "== desktop server log"
             tail -20 "$LOGS/desktop-server.log" 2>&1

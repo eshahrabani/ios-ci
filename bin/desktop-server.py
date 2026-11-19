@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Serve the console desktop as frames and inject input.
+"""Serve the console desktop as live frames and inject input.
 
 Run in the console session (so clicks and keys reach the GUI):
 
     launchctl asuser <uid> python3 desktop-server.py <port> <token> <host>
 
-Frames are written by a separate capture loop to FRAME; this process only serves the
-newest one. Capturing from here would put this interpreter in the TCC responsibility
-chain, and macOS raises a modal consent dialog there that ignores synthetic input.
+Frames are written by a separate capture process (bin/screen-stream.swift) to FRAME;
+this process only serves the newest one. Capturing from here would put this interpreter
+in the TCC responsibility chain, and macOS raises a modal consent dialog there that
+ignores synthetic input.
+
+The page holds one multipart/x-mixed-replace connection and the browser renders frames
+as they arrive: no polling latency, and a slow client simply sees fewer frames because
+the writer blocks (the next write always sends the newest frame).
 """
 import http.server
+import json
 import os
 import shutil
 import subprocess
@@ -22,13 +28,21 @@ PORT = int(sys.argv[1])
 TOKEN = sys.argv[2]
 BIND = sys.argv[3] if len(sys.argv) > 3 else "0.0.0.0"
 FRAME = "/tmp/desktop-frame.jpg"
+
 LOCK = threading.Lock()
-CACHE = [0.0, b""]
+COND = threading.Condition(LOCK)
+CACHE = [0.0, b""]                      # mtime, bytes of the newest frame
+STATS = {"frames": 0, "recent": []}     # capture timestamps in the last two seconds
+DIMS = [0, 0]
 KEYCODES = {
     "Enter": 36, "Return": 36, "Tab": 48, "Backspace": 51, "Delete": 117,
     "Escape": 53, " ": 49, "ArrowLeft": 123, "ArrowRight": 124, "ArrowDown": 125,
     "ArrowUp": 126, "Home": 115, "End": 119, "PageUp": 116, "PageDown": 121,
+    "F1": 122, "F2": 120, "F3": 99, "F4": 118, "F5": 96, "F6": 97,
+    "F7": 98, "F8": 100, "F9": 101, "F10": 109, "F11": 103, "F12": 111,
 }
+APPLE_MODIFIERS = {"cmd": "command down", "ctrl": "control down",
+                   "alt": "option down", "shift": "shift down"}
 
 
 def cliclick_path():
@@ -52,22 +66,6 @@ def osa(script):
     return run(["osascript", "-e", script])
 
 
-def frame():
-    """Return (mtime, bytes) of the newest frame written by the capture loop."""
-    with LOCK:
-        try:
-            stamp = os.stat(FRAME).st_mtime
-        except OSError:
-            return CACHE[0], CACHE[1]
-        if stamp != CACHE[0] or not CACHE[1]:
-            try:
-                CACHE[1] = open(FRAME, "rb").read()
-                CACHE[0] = stamp
-            except OSError:
-                pass
-        return CACHE[0], CACHE[1]
-
-
 def dimensions(data):
     if data[:8] == b"\x89PNG\r\n\x1a\n" and len(data) >= 24:
         return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
@@ -89,83 +87,115 @@ def dimensions(data):
     return 1024, 768
 
 
+def frame_locked():
+    """Return (mtime, bytes) of the newest frame. Caller holds COND."""
+    try:
+        stamp = os.stat(FRAME).st_mtime
+    except OSError:
+        return CACHE[0], CACHE[1]
+    if stamp != CACHE[0] or not CACHE[1]:
+        try:
+            CACHE[1] = open(FRAME, "rb").read()
+            CACHE[0] = stamp
+        except OSError:
+            pass
+    return CACHE[0], CACHE[1]
+
+
+def frame():
+    with COND:
+        return frame_locked()
+
+
+def watch():
+    """Notice new frames, keep the cache warm, and track the capture rate."""
+    last = None
+    while True:
+        time.sleep(0.004)
+        try:
+            stamp = os.stat(FRAME).st_mtime
+        except OSError:
+            continue
+        if stamp == last:
+            continue
+        last = stamp
+        with COND:
+            _, data = frame_locked()
+            now = time.time()
+            STATS["frames"] += 1
+            STATS["recent"] = [t for t in STATS["recent"] if now - t <= 2.0] + [now]
+            DIMS[:] = list(dimensions(data))
+            COND.notify_all()
+
+
 PAGE = """<!doctype html><meta charset="utf-8">
 <title>ios-ci desktop</title>
 <style>
  html,body{margin:0;height:100%;background:#000;overflow:hidden;
    font:12px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#9aa0a6}
- canvas{display:block;width:100vw;height:100vh;touch-action:none;cursor:crosshair}
+ #screen{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain;
+   background:#000;cursor:crosshair;touch-action:none;user-select:none;
+   -webkit-user-select:none;-webkit-user-drag:none}
  #hud{position:fixed;left:10px;bottom:10px;background:#000b;padding:6px 9px;
    border-radius:6px;white-space:pre;pointer-events:none}
 </style>
-<canvas id=c></canvas><div id=hud>connecting…</div>
+<img id=screen alt="" draggable=false><div id=hud>connecting…</div>
 <script>
 const token = new URLSearchParams(location.search).get('t');
-const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const img = document.getElementById('screen');
 const hud = document.getElementById('hud');
-let size = [0, 0], box = [0, 0, 1, 1], since = 0, frames = 0, fps = 0, last = null;
-let lastFrame = 0;
-
-const log = m => { hud.textContent = m; };
-
-function fit() {
-  const dpr = devicePixelRatio || 1;
-  cv.width = Math.round(innerWidth * dpr);
-  cv.height = Math.round(innerHeight * dpr);
-  const s = Math.min(cv.width / (size[0] || 1), cv.height / (size[1] || 1));
-  const w = (size[0] || 1) * s, h = (size[1] || 1) * s;
-  box = [(cv.width - w) / 2, (cv.height - h) / 2, w, h];
-  draw();
-}
-function draw() {
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, cv.width, cv.height);
-  if (last) ctx.drawImage(last, box[0], box[1], box[2], box[3]);
-}
-async function poll() {
-  try {
-    const r = await fetch('/frame.jpg?t=' + token + '&since=' + since);
-    if (r.status === 200) {
-      since = Number(r.headers.get('X-Frame-Time') || 0);
-      const bmp = await createImageBitmap(await r.blob());
-      if (bmp.width !== size[0] || bmp.height !== size[1]) { size = [bmp.width, bmp.height]; fit(); }
-      last = bmp; draw(); frames++; lastFrame = Date.now();
-    } else if (r.status === 503) { log('capture unavailable'); }
-  } catch (e) { log('frame error: ' + e.message); }
-  setTimeout(poll, 60);
-}
-setInterval(() => {
-  fps = frames; frames = 0;
-  if (size[0]) {
-    const stalled = lastFrame && Date.now() - lastFrame > 6000;
-    log('desktop ' + size[0] + 'x' + size[1] + '  ' + fps + ' fps' +
-        (stalled ? '  STALLED (capture stopped)' : '') + hint);
-  }
-}, 1000);
+const KEYNAMES = new Set(['Enter','Tab','Backspace','Delete','Escape','ArrowUp',
+  'ArrowDown','ArrowLeft','ArrowRight','Home','End','PageUp','PageDown',
+  'F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12']);
+const MODIFIER_KEYS = new Set(['Shift','Control','Alt','Meta','CapsLock','OS','AltGraph']);
+const PUNCTUATION = {Minus:'-',Equal:'=',BracketLeft:'[',BracketRight:']',Backslash:'\\\\',
+  Semicolon:';',Quote:"'",Comma:',',Period:'.',Slash:'/',Backquote:'`',Space:' '};
 let hint = '';
-addEventListener('resize', fit);
 
+function log(message) { hud.textContent = message; }
+function connect() {
+  img.src = '/stream.mjpg?t=' + token + '&n=' + Math.random().toString(36).slice(2);
+}
+img.addEventListener('error', () => { log('stream lost; reconnecting'); setTimeout(connect, 1500); });
+connect();
+
+function contentBox() {
+  const nw = img.naturalWidth, nh = img.naturalHeight;
+  if (!nw || !nh) return null;
+  const ew = img.clientWidth || innerWidth, eh = img.clientHeight || innerHeight;
+  const scale = Math.min(ew / nw, eh / nh);
+  return [(ew - nw * scale) / 2, (eh - nh * scale) / 2, nw * scale, nh * scale];
+}
 function imageXY(e) {
-  const dpr = devicePixelRatio || 1;
-  return [(e.clientX * dpr - box[0]) / box[2], (e.clientY * dpr - box[1]) / box[3]];
+  const box = contentBox();
+  if (!box) return null;
+  return [(e.clientX - box[0]) / box[2], (e.clientY - box[1]) / box[3]];
 }
 async function send(path, params) {
   try {
-    const q = new URLSearchParams(params); q.set('t', token);
-    const r = await fetch(path + '?' + q);
+    const query = new URLSearchParams(params);
+    query.set('t', token);
+    const r = await fetch(path + '?' + query);
     hint = '  ' + path + ' ' + (await r.text());
   } catch (err) { hint = '  ' + path + ' failed'; }
 }
+
 let down = false, start = [0, 0], dragging = false, pending = null, timer = null;
-cv.addEventListener('pointerdown', e => {
-  cv.setPointerCapture(e.pointerId);
-  start = imageXY(e); down = true; dragging = false;
+img.addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;          // right button belongs to contextmenu alone
+  const point = imageXY(e);
+  if (!point) return;
+  img.setPointerCapture(e.pointerId);
+  start = point; down = true; dragging = false;
+  e.preventDefault();
 });
-cv.addEventListener('pointermove', e => {
+img.addEventListener('pointermove', e => {
   if (!down) return;
-  const [fx, fy] = imageXY(e);
-  if (Math.abs(fx - start[0]) * (size[0] || 1) < 3 &&
-      Math.abs(fy - start[1]) * (size[1] || 1) < 3) return;
+  const point = imageXY(e);
+  if (!point) return;
+  const [fx, fy] = point;
+  if (!dragging && Math.abs(fx - start[0]) * img.naturalWidth < 3 &&
+      Math.abs(fy - start[1]) * img.naturalHeight < 3) return;
   if (!dragging) { dragging = true; send('/down', {fx: start[0], fy: start[1]}); }
   pending = [fx, fy];
   if (!timer) timer = setTimeout(() => {
@@ -173,20 +203,23 @@ cv.addEventListener('pointermove', e => {
     if (pending) { const p = pending; pending = null; send('/move', {fx: p[0], fy: p[1]}); }
   }, 40);
 });
-cv.addEventListener('pointerup', e => {
-  if (!down) return;
+img.addEventListener('pointerup', e => {
+  if (e.button !== 0 || !down) return;
   down = false;
-  const [fx, fy] = imageXY(e);
-  if (dragging) send('/up', {fx, fy});
-  else send('/click', {fx, fy});
+  const point = imageXY(e);
+  if (!point) return;
+  if (dragging) send('/up', {fx: point[0], fy: point[1]});
+  else send('/click', {fx: point[0], fy: point[1]});
   dragging = false;
 });
-cv.addEventListener('contextmenu', e => {
+img.addEventListener('pointercancel', () => { down = false; dragging = false; });
+img.addEventListener('dragstart', e => e.preventDefault());
+img.addEventListener('contextmenu', e => {
   e.preventDefault();
-  const [fx, fy] = imageXY(e);
-  send('/rclick', {fx, fy});
+  const point = imageXY(e);
+  if (point) send('/rclick', {fx: point[0], fy: point[1]});
 });
-cv.addEventListener('wheel', e => {
+img.addEventListener('wheel', e => {
   e.preventDefault();
   send('/scroll', {dy: Math.sign(e.deltaY) * Math.min(10, Math.abs(e.deltaY))});
 }, {passive: false});
@@ -197,18 +230,64 @@ function flush() {
   const t = text; text = '';
   send('/type', {text: t});
 }
+function modifiers(e) {
+  const list = [];
+  if (e.metaKey) list.push('cmd');       // Super on Linux/Windows, Command on macOS
+  if (e.ctrlKey) list.push('ctrl');
+  if (e.altKey) list.push('alt');
+  if (e.shiftKey) list.push('shift');
+  return list.join(',');
+}
+// Chords use the physical key (e.code), so Shift+4 sends Command+Shift+4 rather than
+// the "$" the browser reports for that keystroke.
+function chordKey(e) {
+  const code = e.code || '';
+  if (/^Key[A-Z]$/.test(code)) return code[3].toLowerCase();
+  if (/^Digit[0-9]$/.test(code)) return code[5];
+  if (/^Numpad[0-9]$/.test(code)) return code[6];
+  if (PUNCTUATION[code] !== undefined) return PUNCTUATION[code];
+  if (KEYNAMES.has(e.key)) return e.key;
+  return null;
+}
 addEventListener('keydown', e => {
-  if (e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.key.length === 1) { text += e.key; clearTimeout(flushTimer); flushTimer = setTimeout(flush, 160); }
-  else if (KEYCODES[e.key] !== undefined) { e.preventDefault(); flush(); send('/key', {name: e.key}); }
-  else if (e.key === 'Enter' || e.key === 'Tab' || e.key === 'Backspace' || e.key === 'Escape') {
+  if (MODIFIER_KEYS.has(e.key)) return;   // flags are read from the next key
+  const held = modifiers(e);
+  if (held) {
+    const name = chordKey(e);
+    if (name) {
+      e.preventDefault(); flush();
+      send('/key', {name, mods: held});
+    }
+    return;
+  }
+  if (e.key.length === 1) {
+    text += e.key;
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(flush, 160);
+    e.preventDefault();
+  } else if (KEYNAMES.has(e.key)) {
     e.preventDefault(); flush(); send('/key', {name: e.key});
   }
-  if (e.key.length === 1) e.preventDefault();
 });
-const KEYCODES = {Enter: 1, Tab: 1, Backspace: 1, Escape: 1, ArrowUp: 1, ArrowDown: 1,
-  ArrowLeft: 1, ArrowRight: 1, Home: 1, End: 1, PageUp: 1, PageDown: 1};
-fit(); poll(); cv.focus();
+addEventListener('blur', flush);
+
+let lastStamp = 0, lastChange = Date.now(), statsFailures = 0;
+setInterval(async () => {
+  try {
+    const r = await fetch('/stats?t=' + token, {cache: 'no-store'});
+    const s = await r.json();
+    statsFailures = 0;
+    if (s.stamp !== lastStamp) { lastStamp = s.stamp; lastChange = Date.now(); }
+    const size = s.width ? s.width + 'x' + s.height : 'no frame';
+    const stalled = s.stamp && Date.now() - lastChange > 8000;
+    log('desktop ' + size + '  capture ' + s.fps + ' fps' +
+        (stalled ? '  STALLED (capture stopped)' : '') + hint);
+  } catch (err) {
+    statsFailures += 1;
+    log('stats error: ' + err.message + hint);
+    if (statsFailures >= 3) { statsFailures = 0; connect(); }
+  }
+}, 1000);
 </script>"""
 
 
@@ -228,6 +307,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def stream_frames(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self.connection.settimeout(30)
+        except OSError:
+            pass
+        sent = None
+        while True:
+            with COND:
+                deadline = time.time() + 1.0
+                while True:
+                    stamp, data = frame_locked()
+                    if data and stamp != sent:
+                        break
+                    left = deadline - time.time()
+                    if left <= 0:
+                        break
+                    COND.wait(left)
+            if not data:
+                return
+            if stamp == sent:
+                continue
+            part = (b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                    + str(len(data)).encode() + b"\r\n\r\n" + data + b"\r\n")
+            try:
+                self.wfile.write(part)
+            except OSError:
+                return
+            sent = stamp
+
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
         query = urllib.parse.parse_qs(url.query)
@@ -235,11 +349,42 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send("forbidden", status=403)
         if url.path == "/":
             return self.send(PAGE.encode(), kind="text/html; charset=utf-8")
+        if url.path == "/stream.mjpg":
+            try:
+                return self.stream_frames()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                return
+        if url.path == "/stats":
+            now = time.time()
+            with COND:
+                stamp, data = frame_locked()
+                recent = [t for t in STATS["recent"] if now - t <= 2.0]
+                payload = {"stamp": round(stamp, 3), "frames": STATS["frames"],
+                           "fps": round(len(recent) / 2.0, 1),
+                           "width": DIMS[0], "height": DIMS[1],
+                           "age": round(now - stamp, 1) if stamp and data else None}
+            return self.send(json.dumps(payload), kind="application/json")
         if url.path in ("/frame.jpg", "/frame.png"):
+            since = query.get("since", ["0"])[0]
+            try:
+                wait = min(5.0, max(0.0, float(query.get("wait", ["0"])[0] or 0)))
+            except ValueError:
+                wait = 0.0
             stamp, data = frame()
+            if wait > 0 and data:
+                deadline = time.time() + wait
+                with COND:
+                    while True:
+                        stamp, data = frame_locked()
+                        if not data or f"{stamp:.3f}" != since:
+                            break
+                        left = deadline - time.time()
+                        if left <= 0:
+                            break
+                        COND.wait(left)
             if not data:
                 return self.send("capture unavailable", status=503)
-            if query.get("since", ["0"])[0] == f"{stamp:.3f}":
+            if f"{stamp:.3f}" == since:
                 return self.send(b"", status=204)
             return self.send(data, kind="image/jpeg",
                              extra={"X-Frame-Time": f"{stamp:.3f}"})
@@ -279,16 +424,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.send(f"typed {len(text)}")
         if url.path == "/key":
             name = query.get("name", [""])[0]
+            mods = [m for m in query.get("mods", [""])[0].split(",") if m in APPLE_MODIFIERS]
+            using = ""
+            if mods:
+                using = " using {" + ", ".join(APPLE_MODIFIERS[m] for m in mods) + "}"
+            if len(name) == 1:
+                escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+                osa(f'tell application "System Events" to keystroke "{escaped}"{using}')
+                return self.send(f"key {name!r}{using}")
             code = KEYCODES.get(name)
             if code is None:
                 return self.send("unknown key", status=400)
-            osa(f'tell application "System Events" to key code {code}')
-            return self.send(f"key {name}")
+            osa(f'tell application "System Events" to key code {code}{using}')
+            return self.send(f"key {name}{using}")
         return self.send("not found", status=404)
 
 
 def main():
+    threading.Thread(target=watch, daemon=True).start()
     http.server.ThreadingHTTPServer.allow_reuse_address = True
+    http.server.ThreadingHTTPServer.daemon_threads = True
     server = http.server.ThreadingHTTPServer((BIND, PORT), Handler)
     print(f"serving on {BIND}:{PORT}", flush=True)
     server.serve_forever()

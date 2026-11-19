@@ -177,7 +177,7 @@ async function send(path, params) {
     const query = new URLSearchParams(params);
     query.set('t', token);
     const r = await fetch(path + '?' + query);
-    hint = '  ' + path + ' ' + (await r.text());
+    hint = '  ' + (await r.text());
   } catch (err) { hint = '  ' + path + ' failed'; }
 }
 

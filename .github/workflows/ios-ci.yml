@@ -386,18 +386,20 @@ jobs:
           brew install cliclick 2>&1 | tail -2 || true
           CLICLICK=$(command -v cliclick || echo /opt/homebrew/bin/cliclick)
           echo "cliclick: ${CLICLICK}"
-          # Accessibility for the injected events, and for the tools that post them.
-          TCCDB="/Library/Application Support/com.apple.TCC/TCC.db"
-          for client in "/usr/bin/python3" "$CLICLICK" "/bin/bash"; do
-            for service in kTCCServiceAccessibility kTCCServiceScreenCapture; do
-              sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('$service','$client',1,2,0,1,0)" 2>&1 | head -1 || true
+          # Accessibility and capture for the injected events, in BOTH databases: the
+          # console session consults its own user database, and a grant only in the
+          # system one leaves events dropped after the consent prompt times out.
+          USER_TCC="/Users/${CONSOLE_USER}/Library/Application Support/com.apple.TCC/TCC.db"
+          for db in "/Library/Application Support/com.apple.TCC/TCC.db" "$USER_TCC"; do
+            for client in "/usr/bin/python3" "$CLICLICK" "/bin/bash" "/usr/bin/osascript"; do
+              for service in kTCCServiceAccessibility kTCCServiceScreenCapture; do
+                sudo sqlite3 "$db" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('$service','$client',1,2,0,1,0)" 2>&1 | head -1 || true
+              done
             done
           done
           sudo killall tccd 2>/dev/null || true
           sleep 1
-          # Prove that events land before announcing a desktop nobody can drive.
           "$CLICLICK" m:520,520 2>&1 | head -2
-          sudo launchctl asuser "$CONSOLE_UID" "$CLICLICK" m:640,360 2>&1 | head -2 || true
           echo "pointer: $(sudo launchctl asuser "$CONSOLE_UID" "$CLICLICK" p 2>&1 | head -1)"
 
           curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/desktop-server.py" \
@@ -411,6 +413,7 @@ jobs:
             exit 1
           fi
           HOST="${TS_IP:-$TS_DNS}"
+          PORT=6080
           # Capture from this shell: it already holds the screen-recording grant, so the
           # frame stream never triggers the modal consent prompt that freezes input.
           rm -f /tmp/desktop-frame.png
@@ -452,8 +455,21 @@ jobs:
           fi
           echo "desktop server listening"
           echo "frame bytes: $(stat -f%z /tmp/desktop-frame.png 2>/dev/null || echo 0)"
+          # Prove input works before publishing: a click on the Apple menu must change
+          # the frame, and the change must be undone by Escape.
+          sleep 1
+          BEFORE=$(shasum /tmp/desktop-frame.png | cut -d' ' -f1)
+          curl -s -m 15 "http://${HOST}:${PORT}/click?fx=0.02&fy=0.02&t=${TOKEN}" >/dev/null || true
+          sleep 2
+          AFTER=$(shasum /tmp/desktop-frame.png | cut -d' ' -f1)
+          curl -s -m 15 "http://${HOST}:${PORT}/key?name=Escape&t=${TOKEN}" >/dev/null || true
+          if [[ "$BEFORE" == "$AFTER" ]]; then
+            echo "input self-test: NO CHANGE (clicks are not landing)"
+          else
+            echo "input self-test: click changed the screen"
+          fi
 
-          DESKTOP_URL="http://${HOST}:6080/?t=${TOKEN}"
+          DESKTOP_URL="http://${HOST}:${PORT}/?t=${TOKEN}"
           {
             echo "run_id: ${RUN_ID}"
             echo "repo: ${APP_DIR:-}"

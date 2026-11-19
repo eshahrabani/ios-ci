@@ -352,189 +352,73 @@ jobs:
       # signs in as the `tester` account created here; clients must support Apple
       # Screen Sharing auth (macOS Screen Sharing, RealVNC, Jump). Remmina, TigerVNC
       # and other plain-VNC clients cannot authenticate to macOS 26.
-      - name: Enable VNC desktop
+      - name: Open the desktop
         if: always() && inputs.manual_minutes != '0'
         timeout-minutes: 10
         env:
           RUN_ID: ${{ github.run_id }}
           APP_REPO: ${{ secrets.APP_REPO }}
           APP_DEPLOY_KEY: ${{ secrets.APP_DEPLOY_KEY }}
-          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
-          VNC_USER_PASSWORD: ${{ secrets.VNC_USER_PASSWORD }}
           MANUAL_MINUTES: ${{ inputs.manual_minutes }}
+          SERVER_SHA: ${{ github.sha }}
+          SERVER_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           LOGS="$RUNNER_TEMP/ci-logs"
           mkdir -p "$LOGS"
-          # Every line lands in ci-logs: the public step log is deleted when the job
-          # ends, so a failure here would otherwise leave no reason behind.
           exec > >(tee -a "$LOGS/vnc-step.log") 2>&1
 
-          if [[ ${#VNC_PASSWORD} -lt 8 ]]; then
-            echo "VNC_PASSWORD must be at least 8 characters (legacy VNC uses the first 8)"
-            exit 1
-          fi
-          # A sleeping display is a black screen on a VNC client.
+          # Screen Sharing cannot be used here: on macOS 26 its agent dies with
+          # "Unable to capture screen" because the capture permission is gated behind
+          # managed (MDM) preferences, and a client therefore receives a black frame.
+          # `screencapture` and "System Events" both work in the console session, so
+          # the desk is served as PNG frames with clicks and keys injected instead.
           sudo pmset -a displaysleep 0 sleep 0 disksleep 0 || true
           caffeinate -u -t 2 || true
-
-          KICKSTART=/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/Resources/kickstart
           CONSOLE_USER=$(stat -f%Su /dev/console 2>/dev/null || echo root)
           CONSOLE_UID=$(id -u "$CONSOLE_USER" 2>/dev/null || echo 501)
-          # Apple auth is the only path that streams on the Intel image; keep an account
-          # whose password is known so the client can use it, and grant it ARD.
-          if [[ -n "${VNC_USER_PASSWORD:-}" ]]; then
-            VNC_USER=tester
-            if ! dscl . -list /Users | grep -qx "$VNC_USER"; then
-              sudo sysadminctl -addUser "$VNC_USER" -fullName "iOS CI tester" \
-                -password "$VNC_USER_PASSWORD" -admin </dev/null 2>&1 || true
-            fi
-            if dscl . -authonly "$VNC_USER" "$VNC_USER_PASSWORD" </dev/null 2>/dev/null; then
-              sudo "$KICKSTART" -configure -allowAccessFor -specifiedUsers </dev/null || true
-              sudo "$KICKSTART" -activate -configure -access -on \
-                -users "$VNC_USER" -privs -all -restart -agent -console </dev/null || true
-            fi
-          fi
-          # Legacy VNC auth needs no account: the server checks an 8-character password
-          # and attaches the client to the console session, whose desktop is the one
-          # captured below. Apple auth instead creates a session for the authenticated
-          # account, and such a session renders black on this VM (measured).
-          sudo "$KICKSTART" -activate -configure -access -on \
-            -allowAccessFor -allUsers -privs -all \
-            -clientopts -setvnclegacy -vnclegacy yes \
-            -restart -agent -console </dev/null
-
-          # The legacy password: first 8 characters, XORed with Apple's fixed key and
-          # stored as hex in VNCSettings.
-          printf '%s' "$VNC_PASSWORD" | perl -we '
-            BEGIN { @k = unpack "C*", pack "H*", "1734516E8BA8C5E2FF1C39567390ADCA" }
-            $_ = <STDIN>;
-            chomp;
-            s/^(.{8}).*/$1/;
-            @p = unpack "C*", $_;
-            foreach (@k) { printf "%02X", $_ ^ (shift @p || 0) }
-            print "\n"' \
-            | sudo tee /Library/Preferences/com.apple.VNCSettings.txt >/dev/null
-          sudo chmod 644 /Library/Preferences/com.apple.VNCSettings.txt
-
-          # The daemon refuses to capture unless these are on; with them unset its
-          # checkin line reads "screenCaptureFlag 0" and every client gets a black
-          # framebuffer ("allowRemoteScreenObservation key not set" in its log).
-          sudo defaults write /Library/Preferences/com.apple.RemoteManagement.plist \
-            allowRemoteScreenObservation -bool true
-          sudo defaults write /Library/Preferences/com.apple.RemoteManagement.plist \
-            allowScreenShot -bool true
-          # cfprefsd serves the old values until it is restarted.
-          sudo killall cfprefsd 2>/dev/null || true
-          sleep 2
-          # The daemon refuses to capture until it holds the Screen Recording grant;
-          # with it missing its checkin line reads screenCaptureFlag 0 and clients get
-          # a black framebuffer. The images keep that TCC database writable by root.
-          TCCDB="/Library/Application Support/com.apple.TCC/TCC.db"
-          for client in \
-            "/System/Library/CoreServices/RemoteManagement/screensharingd" \
-            "/System/Library/CoreServices/RemoteManagement/ARDAgent.app/Contents/MacOS/ARDAgent" \
-            "com.apple.RemoteDesktop.agent" \
-            "com.apple.ScreenSharing" \
-            "com.apple.screensharingd"; do
-            ctype=1
-            [[ "$client" == com.apple.* ]] && ctype=0
-            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceScreenCapture','$client',$ctype,2,0,1,0)" 2>&1 | head -2 || true
-          done
-          # Control needs Accessibility too, for the agent and for the tooling below.
-          for client in "/bin/bash" "/usr/bin/osascript" "com.apple.RemoteDesktop.agent"; do
-            ctype=1
-            [[ "$client" == com.apple.* ]] && ctype=0
-            sudo sqlite3 "$TCCDB" "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceAccessibility','$client',$ctype,2,0,1,0)" 2>&1 | head -2 || true
-          done
-          sudo killall tccd 2>/dev/null || true
-          sleep 1
-          # Restart the agent and the daemon in that order: the daemon caches the
-          # agent's XPC port and reports "invalid agent port" if it starts first.
-          sudo launchctl kickstart -k "gui/$CONSOLE_UID/com.apple.RemoteDesktop.agent" 2>&1 || true
-          sudo killall ARDAgent 2>/dev/null || true
-          sleep 2
-          sudo launchctl kickstart -k system/com.apple.screensharing 2>&1 || true
-          sleep 2
-          sudo launchctl load -w /System/Library/LaunchDaemons/com.apple.screensharing.plist 2>/dev/null || true
-          sudo launchctl kickstart -k system/com.apple.screensharing 2>/dev/null || true
-          sudo "$KICKSTART" -restart -agent -console </dev/null || true
-          caffeinate -d -i -m -s -u -t 7200 &
-
-          for _ in $(seq 1 30); do
-            sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1 && break
-            sleep 1
-          done
-          if ! sudo lsof -iTCP:5900 -sTCP:LISTEN >/dev/null 2>&1; then
-            echo "Screen Sharing is not listening on 5900"
-            sudo lsof -iTCP -sTCP:LISTEN | head -20 || true
-            exit 1
-          fi
-
-          # The Intel image is a VMware VM; make the desktop usable if the tool exists.
-          if [[ -x "/Library/Application Support/VMware Tools/vmware-resolutionSet" ]]; then
-            sudo "/Library/Application Support/VMware Tools/vmware-resolutionSet" 1920 1080 || true
-          fi
-
-          # Evidence that the desk exists, published with the address: the console
-          # framebuffer captured as the logged-in user.
           echo "console user: ${CONSOLE_USER}"
+
+          # Evidence that the desk exists, published with the address.
           sudo launchctl asuser "$CONSOLE_UID" screencapture -x "$LOGS/desktop.png" 2>&1 || true
 
-          # Why can the daemon not stream? Its own log says so.
-          {
-            echo "== kickstart options"
-            sudo "$KICKSTART" -h 2>&1 | grep -Ei 'screen|control|curtain|capture' | head -20
-            echo "== runner auth authority"
-            dscl . -read /Users/runner AuthenticationAuthority 2>&1 | head -4
-            echo "== empty password probe"
-            dscl . -authonly runner "" </dev/null 2>&1 || echo "empty rejected"
-            echo "== remote management prefs"
-            sudo defaults read /Library/Preferences/com.apple.RemoteManagement 2>&1 | head -6
-            echo "== input probe (can anything inject events?)"
-            sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
-              -e 'tell application "System Events" to keystroke "a"' 2>&1 | head -3
-            sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
-              -e 'tell application "System Events" to get name of first process' 2>&1 | head -3
-            echo "== tcc rows"
-            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-              "select client, auth_value from access where service='kTCCServiceScreenCapture'" 2>&1 | head -6
-            echo "== tcc write"
-            sudo sqlite3 "/Library/Application Support/com.apple.TCC/TCC.db" \
-              "insert or replace into access (service, client, client_type, auth_value, auth_reason, auth_version, flags) values ('kTCCServiceScreenCapture','/System/Library/CoreServices/RemoteManagement/screensharingd',0,2,0,1,0)" 2>&1 | head -3
-            echo "== capture flag"
-            sudo log show --predicate 'process == "screensharingd"' --last 2m 2>/dev/null \
-              | grep -E 'SSDaemon_Checkin|allowRemoteScreenObservation' | tail -3
-            echo "== screensharingd log"
-            sudo log show --predicate 'process == "screensharingd"' --last 5m 2>/dev/null | tail -40
-            echo "== windowserver display"
-            sudo log show --predicate 'process == "WindowServer"' --last 2m 2>/dev/null | grep -Ei 'display|capture|stream' | tail -10
-          } 2>&1 || true
-
-          # The tailnet IP resolves everywhere; MagicDNS only for clients whose resolver
-          # uses Tailscale's, which a tester's Linux box often does not.
-          TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          curl -fsSL "https://raw.githubusercontent.com/${SERVER_REPO}/${SERVER_SHA}/bin/desktop-server.py" \
+            -o "$RUNNER_TEMP/desktop-server.py"
+          TOKEN=$(python3 -c 'import secrets; print(secrets.token_urlsafe(18))')
           TS_IP=$(tailscale ip -4 2>/dev/null | head -1 || true)
-          VNC_ADDRESS="${TS_IP:-$TS_DNS}:5900"
-          if [[ "$VNC_ADDRESS" == ":5900" ]]; then
+          TS_DNS=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//' || true)
+          if [[ -z "$TS_IP" && -z "$TS_DNS" ]]; then
             echo "could not determine the Tailscale address"
             tailscale status || true
             exit 1
           fi
+          HOST="${TS_IP:-$TS_DNS}"
+          sudo launchctl asuser "$CONSOLE_UID" /bin/bash -c \
+            "nohup /usr/bin/python3 '$RUNNER_TEMP/desktop-server.py' 6080 '$TOKEN' '$HOST' > '$LOGS/desktop-server.log' 2>&1 &"
+          sudo launchctl asuser "$CONSOLE_UID" /usr/bin/osascript \
+            -e 'tell application "System Events" to get name of first process' >/dev/null 2>&1 || true
+          caffeinate -d -i -m -s -u -t 7200 &
 
+          for _ in $(seq 1 30); do
+            sudo lsof -iTCP:6080 -sTCP:LISTEN >/dev/null 2>&1 && break
+            sleep 1
+          done
+          if ! sudo lsof -iTCP:6080 -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "the desktop server is not listening on 6080"
+            cat "$LOGS/desktop-server.log" 2>/dev/null || true
+            exit 1
+          fi
+          echo "desktop server listening"
+
+          DESKTOP_URL="http://${HOST}:6080/?t=${TOKEN}"
           {
             echo "run_id: ${RUN_ID}"
             echo "repo: ${APP_DIR:-}"
-            echo "vnc_address: ${VNC_ADDRESS}"
-            echo "vnc_dns: ${TS_DNS}:5900"
+            echo "desktop_url: ${DESKTOP_URL}"
             echo "session_minutes: ${MANUAL_MINUTES}"
-            echo "vnc_auth: vnc,apple"
-            echo "vnc_user: ${VNC_USER:-none}"
             echo "ready_at: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           } > "$LOGS/manual-ready.txt"
 
-          # Publish through the private app repo; the deploy key exists only for this
-          # push and is removed before the manual hold.
           KEY="$RUNNER_TEMP/manual_key"
           trap 'rm -f "$KEY"' EXIT
           printf '%s\n' "$APP_DEPLOY_KEY" > "$KEY"
@@ -553,9 +437,9 @@ jobs:
           git -C "$TMP" add ci-logs/desktop.png 2>/dev/null || true
           git -C "$TMP" commit -q -m "manual session ready ${RUN_ID}"
           git -C "$TMP" push --force "git@github.com:${APP_REPO}.git" HEAD:refs/heads/ci-logs
-          echo "VNC_READY=1" >> "$GITHUB_ENV"
-          echo "VNC_ADDRESS=${VNC_ADDRESS}" >> "$GITHUB_ENV"
-          echo "remote desktop ready; address published to the private ci-logs branch"
+          echo "DESKTOP_READY=1" >> "$GITHUB_ENV"
+          echo "DESKTOP_URL=${DESKTOP_URL}" >> "$GITHUB_ENV"
+          echo "desktop ready; url published to the private ci-logs branch"
 
       - name: Install Maestro
         if: always() && inputs.manual_minutes == '0' && steps.boot.outcome == 'success'
@@ -682,8 +566,8 @@ jobs:
           set -euo pipefail
           LOGS="$RUNNER_TEMP/ci-logs"
           mkdir -p "$LOGS"
-          if [[ "${VNC_READY:-0}" != "1" ]]; then
-            echo "remote desktop was not enabled; skipping the manual hold"
+          if [[ "${DESKTOP_READY:-0}" != "1" ]]; then
+            echo "the desktop was not enabled; skipping the manual hold"
             exit 0
           fi
           caffeinate -u -t 1 || true

@@ -46,21 +46,19 @@ options:
                       generated and installed as a write deploy key when missing)
   --runner OWNER/NAME runner repo (default: eshahrabani/ios-ci or $IOS_CI_RUNNER)
   --timeout MIN       minutes to wait for the run (default: 60)
-  --manual MINUTES    boot a VNC desktop with the app cloned for graphical work (1-300)
+  --manual MINUTES    boot a desktop (browser URL) with the app cloned (1-300)
   --dry-run           print the commands instead of executing them
   -h, --help          this text
 
 manual sessions:
   no build runs: the app is cloned into ~/<app> on the desktop, with Xcode, the iOS
   simulators, node and yarn ready, so the build happens graphically.
-  The tester's machine must be on the same Tailscale tailnet. Repo secrets:
-  TAILSCALE_AUTH_KEY (a reusable auth key: tskey-auth-…) and VNC_USER_PASSWORD.
-  The desktop is reached as the `tester` account with VNC_USER_PASSWORD, using Apple
-  ARD authentication (RFB type 30): iVNC on Linux/Windows/macOS, or macOS Screen
-  Sharing. Remmina, TigerVNC and other plain-VNC clients cannot authenticate to
-  macOS 26, whose server advertises legacy VNC auth but drops it.
-  The CLI prints the VNC address when the desktop is ready. --manual accepts 1-300
-  minutes; the hosted job cap is 360.
+  The desktop is served over the tailnet as PNG frames with clicks and keys injected
+  (Screen Sharing itself cannot capture on macOS 26: its agent needs a managed
+  permission profile, which a hosted runner cannot install).
+  The tester's machine must be on the same tailnet. Repo secrets: TAILSCALE_AUTH_KEY
+  (a reusable auth key: tskey-auth-…). The CLI prints the desktop URL with its
+  per-run token when the desktop is ready. --manual accepts 1-300 minutes.
 
 examples:
   ios-ci.sh prepare && ios-ci.sh run
@@ -319,7 +317,7 @@ cmd_run() {
   local status conclusion elapsed=0
   while [[ "$elapsed" -lt $((TIMEOUT_MIN * 60)) ]]; do
     if [[ "$MANUAL_MINUTES" != "0" && "$manual_ready" != true ]]; then
-      local manual_file vnc_address ready_run ready_user
+      local manual_file desktop_url ready_run
       manual_file=$(gh api "repos/$app/contents/ci-logs/manual-ready.txt?ref=ci-logs" \
         -H 'Accept: application/vnd.github.raw' 2>/dev/null || true)
       if [[ -n "$manual_file" ]]; then
@@ -329,13 +327,11 @@ cmd_run() {
         [[ "$ready_run" == "$run_id" ]] || manual_file=""
       fi
       if [[ -n "$manual_file" ]]; then
-        vnc_address=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_address: //p' | head -1)
-        ready_user=$(printf '%s\n' "$manual_file" | sed -n 's/^vnc_user: //p' | head -1)
-        if [[ -n "$vnc_address" ]]; then
+        desktop_url=$(printf '%s\n' "$manual_file" | sed -n 's/^desktop_url: //p' | head -1)
+        if [[ -n "$desktop_url" ]]; then
           manual_ready=true
-          note "manual : VNC desktop ready at $vnc_address"
-          note "         password: the 8-character VNC_PASSWORD secret; no username"
-          note "         any VNC client works: legacy VNC auth reaches the console desktop"
+          note "manual : desktop ready at $desktop_url"
+          note "         open that URL in a browser: the macOS desktop, clickable and typable"
         fi
       fi
     fi
@@ -414,7 +410,7 @@ report() {
     note "  flow     : $(grep -E 'Flow (Passed|Failed)|flow passed|flow failed' "$out/ci-logs/maestro.log" | tail -1 || echo 'see maestro.log')"
   fi
   if [[ -f "$out/ci-logs/manual-ready.txt" ]]; then
-    note "  manual   : $(sed -n 's/^vnc_address: //p' "$out/ci-logs/manual-ready.txt" | head -1)"
+    note "  desktop  : $(sed -n 's/^desktop_url: //p' "$out/ci-logs/manual-ready.txt" | head -1)"
   fi
   local media
   media=$(find "$out" -type f \( -name '*.png' -o -name '*.mp4' -o -name '*.mov' \) 2>/dev/null | sort)

@@ -1,0 +1,25 @@
+name: idle probe
+run-name: idle probe
+on: {workflow_dispatch: {}}
+permissions: {contents: read}
+jobs:
+  p:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - name: Measure capture cost against display activity
+        run: |
+          set +e
+          timeit() {
+            local label=$1 n=0 t0 t1
+            for i in 1 2 3 4 5; do
+              t0=$(python3 -c 'import time;print(time.time())')
+              screencapture -x -t jpg /tmp/i.jpg
+              t1=$(python3 -c 'import time;print(time.time())')
+              n=$(python3 -c "print(round($t1-$t0,3))"); printf '%s %s\n' "$label" "$n"
+            done
+          }
+          timeit idle
+          open -a Finder; sleep 2; timeit finder
+          open -a "Activity Monitor"; sleep 3; timeit activity-monitor
+          caffeinate -u -t 1; timeit after-wake

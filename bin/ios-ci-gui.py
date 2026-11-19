@@ -1011,6 +1011,9 @@ class MainWindow(QMainWindow):
         self._record_ready()
         self._set_progress(self._model)
         self._session_time()
+        # The poll refreshed the dashboard before the light was green, so flip the row
+        # now instead of leaving it at "starting NN%" until the next tick.
+        self._refresh_dashboard()
         self._update_buttons()
 
     def _record_ready(self):

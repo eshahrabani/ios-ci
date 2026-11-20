@@ -691,7 +691,12 @@ function renderGitLine(session) {
   const git = session.git || { state: 'pending' };
   const tools = session.tools || {};
   const login = git.login || tools.git_login || (snapshot().setup.login || '');
-  const signature = JSON.stringify([git.state, git.message, login, tools.git_auth]);
+  const hosts = (Array.isArray(git.hosts) && git.hosts.length
+    ? git.hosts
+    : (Array.isArray(tools.git_hosts) ? tools.git_hosts : []))
+    .map((entry) => (typeof entry === 'string' ? entry : entry && entry.host))
+    .filter(Boolean);
+  const signature = JSON.stringify([git.state, git.message, login, hosts, tools.git_auth]);
   if (signature === ui.gitSignature) return;
   ui.gitSignature = signature;
   const line = $('session-git');
@@ -717,9 +722,15 @@ function renderGitLine(session) {
     return;
   }
   if (git.state === 'configured' || tools.git_auth === true) {
+    const labels = hosts.map((host) => {
+      if (host === 'github.com') return 'GitHub';
+      if (host === 'gitlab.com') return 'GitLab';
+      return host;
+    });
     line.classList.add('success');
     line.innerHTML = icon('check');
-    line.appendChild(el('span', '', `${login ? `@${login} · ` : ''}commits and clones ready`));
+    line.appendChild(el('span', '', `${login ? `@${login} · ` : ''}`
+      + (labels.length > 1 ? `${labels.join(' + ')} ready` : 'commits and clones ready')));
     return;
   }
   line.innerHTML = icon('key');

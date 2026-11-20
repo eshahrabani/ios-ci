@@ -8,7 +8,7 @@ and holds the VM for the minutes you asked for. The local client is an Electron 
 a setup wizard, one-click sessions, history, and the streamed desktop in a window.
 
 Every booted VM is provisioned before the desktop is served: Xcode, an iOS runtime with a
-booted iPhone simulator, Node.js, Yarn 4 and Git. Your Git name, email and GitHub
+booted iPhone simulator, Node.js, Yarn 4 and Git. Your Git name, email and Git
 credentials are installed too, so a private clone works immediately.
 
 ## Requirements
@@ -68,13 +68,17 @@ Expect the desktop about a minute after starting, depending on the runner queue.
 first session at a new commit compiles the screen streamer (~25 s); later sessions restore
 it from the cache. Provisioning adds time only when Xcode's iOS runtime must be downloaded.
 
-Private clones work for the active `gh` host (github.com or a GHES host):
+Private clones work for the active `gh` host (github.com or a GHES host) and
+`gitlab.com`:
 
+* The app sends the `gh` token for the GitHub host and reads the local HTTPS credential
+  for GitLab with `git credential fill`. It also tries hosts named by the remotes of the
+  folder chosen under **Copy a local folder**.
 * HTTPS remotes use the installed credential helper.
 * `git@<host>:org/repo.git` and `ssh://git@<host>/…` are rewritten to HTTPS.
 
-Non-GitHub remotes are not authenticated. Both machines must be on the same tailnet, and
-its ACLs must allow TCP 6080 to the runner node.
+Other hosts, and SSH keys, are not copied. Both machines must be on the same tailnet,
+and its ACLs must allow TCP 6080 to the runner node.
 
 ## Development
 

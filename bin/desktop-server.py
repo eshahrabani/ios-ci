@@ -28,10 +28,11 @@ the screen. A client turns its light green only when frames and input both work.
 Uploads go the other way: POST /upload?t=<token>&name=<dir> stores a tar.gz in the
 tester's home, so a directory from their machine appears inside the session.
 
-Git credentials arrive through POST /git-setup: the local identity, the GitHub host and
-a token are written into the console user's global git config plus a credential helper,
-so private clones work with both HTTPS and SSH-form URLs. `/stats.tools` reports what
-provisioning installed and whether Git authentication is configured.
+Git credentials arrive through POST /git-setup: the local identity and one credential
+per host (GitHub, GitLab, or a remote of the copied folder) are written into the console
+user's global git config plus one credential helper, so private clones work with both
+HTTPS and SSH-form URLs. `/stats.tools` reports what provisioning installed and whether
+Git authentication is configured; it never includes a token.
 """
 import base64
 import collections
@@ -81,21 +82,38 @@ TOOLS_CACHE = [0.0, {}]                 # expiry, flat facts
 TOOLS_TTL = 10.0
 ENV_FILE = "/tmp/ios-ci-env.json"
 GIT_DIR = (".config", "ios-ci")
-GIT_TOKEN_NAME = "github-token"
+GIT_CREDENTIALS_DIR = "credentials"
+GIT_LEGACY_TOKEN_NAME = "github-token"
 GIT_HELPER_NAME = "git-credential-ios-ci"
 GIT_MARKER_NAME = "git-configured.json"
 GIT_BODY_MAX = 64 * 1024
+GIT_MAX_HOSTS = 8
+# One helper serves every host: Git passes the host on stdin, and the helper reads
+# the two-line credential file written for that host. Tokens never appear in argv.
 GIT_HELPER = (
     "#!/bin/sh\n"
     "case \"$1\" in\n"
-    "  get)\n"
-    "    printf 'username=x-access-token\\n'\n"
-    "    printf 'password=%s\\n' \"$(cat \"$HOME/.config/ios-ci/github-token\")\"\n"
-    "    ;;\n"
-    "  store|erase)\n"
-    "    exit 0\n"
-    "    ;;\n"
+    "  get) ;;\n"
+    "  *) exit 0 ;;\n"
     "esac\n"
+    "host=\n"
+    "while IFS= read -r line; do\n"
+    "  case \"$line\" in\n"
+    "    host=*) host=${line#host=} ;;\n"
+    "    \"\") break ;;\n"
+    "  esac\n"
+    "done\n"
+    "case \"$host\" in\n"
+    "  \"\"|*[!A-Za-z0-9.-]*) exit 0 ;;\n"
+    "esac\n"
+    "file=\"$HOME/.config/ios-ci/credentials/$host\"\n"
+    "[ -r \"$file\" ] || exit 0\n"
+    "username=$(sed -n '1p' \"$file\")\n"
+    "password=$(sed -n '2p' \"$file\")\n"
+    "[ -n \"$username\" ] || exit 0\n"
+    "[ -n \"$password\" ] || exit 0\n"
+    "printf 'username=%s\\n' \"$username\"\n"
+    "printf 'password=%s\\n' \"$password\"\n"
 )
 
 LOCK = threading.Lock()
@@ -266,7 +284,6 @@ def marker_facts():
     """Identity and auth facts written by /git-setup. Never includes a token."""
     directory = os.path.join(home_dir(), *GIT_DIR)
     marker_path = os.path.join(directory, GIT_MARKER_NAME)
-    token_path = os.path.join(directory, GIT_TOKEN_NAME)
     facts = {}
     marker = None
     try:
@@ -274,16 +291,42 @@ def marker_facts():
             marker = json.load(handle)
     except (OSError, ValueError):
         marker = None
+    hosts = []
     if isinstance(marker, dict):
         for key in ("name", "email", "host", "login"):
             value = marker.get(key)
             if isinstance(value, str) and value:
                 facts["git_" + key] = value
-    try:
-        token_ok = os.path.getsize(token_path) > 0
-    except OSError:
-        token_ok = False
+        raw_hosts = marker.get("hosts")
+        if isinstance(raw_hosts, list):
+            for entry in raw_hosts:
+                host = entry if isinstance(entry, str) else (
+                    entry.get("host") if isinstance(entry, dict) else None)
+                if isinstance(host, str) and re.fullmatch(r"[A-Za-z0-9.-]+", host):
+                    hosts.append(host.lower())
+        if not hosts and isinstance(marker.get("host"), str):
+            hosts.append(marker["host"].lower())
+    hosts = list(dict.fromkeys(hosts))
+    token_ok = False
+    if hosts:
+        credentials = os.path.join(directory, GIT_CREDENTIALS_DIR)
+        for host in hosts:
+            try:
+                if os.path.getsize(os.path.join(credentials, host)) > 0:
+                    token_ok = True
+                    break
+            except OSError:
+                continue
+    if not token_ok:
+        try:
+            token_ok = os.path.getsize(os.path.join(directory, GIT_LEGACY_TOKEN_NAME)) > 0
+        except OSError:
+            token_ok = False
+    if isinstance(marker, dict):
+        facts["git_hosts"] = hosts
     facts["git_auth"] = bool(token_ok and isinstance(marker, dict))
+    if "git_host" not in facts and hosts:
+        facts["git_host"] = hosts[0]
     return facts
 
 
@@ -306,14 +349,35 @@ class GitSetupError(Exception):
     pass
 
 
+def valid_credential(item):
+    """(credential, error) for one host entry."""
+    if not isinstance(item, dict):
+        return None, "each credential must be an object"
+    host = item.get("host")
+    username = item.get("username")
+    token = item.get("token")
+    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", host) \
+            or host in (".", ".."):
+        return None, "each credential host must be a hostname"
+    host = host.lower()
+    if not isinstance(username, str):
+        return None, "username for %s is required" % host
+    username = username.strip()
+    if not 1 <= len(username) <= 100 or not all(ch.isprintable() for ch in username) \
+            or any(ch.isspace() for ch in username):
+        return None, "username for %s must be 1-100 printable characters without spaces" % host
+    if not isinstance(token, str) or not 8 <= len(token) <= 4096 \
+            or not all(ch.isprintable() and not ch.isspace() for ch in token):
+        return None, "token for %s must be 8-4096 characters without whitespace" % host
+    return {"host": host, "username": username, "token": token}, ""
+
+
 def valid_git_request(payload):
     """(request, error) for the /git-setup body."""
     if not isinstance(payload, dict):
         return None, "invalid JSON body"
     name = payload.get("name")
     email = payload.get("email")
-    host = payload.get("host")
-    token = payload.get("token")
     if not isinstance(name, str):
         return None, "name is required"
     name = name.strip()
@@ -322,102 +386,183 @@ def valid_git_request(payload):
     if not isinstance(email, str) or len(email) > 254 \
             or not re.fullmatch(r"[^@\s]+@[^@\s]+", email):
         return None, "email must look like name@example.com"
-    if not isinstance(host, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
-        return None, "host must be a hostname"
-    if not isinstance(token, str) or not re.fullmatch(r"\S{8,4096}", token):
-        return None, "token must be 8-4096 characters without whitespace"
-    return {"name": name, "email": email, "host": host.lower(), "token": token}, ""
+
+    raw = payload.get("credentials")
+    github_host = payload.get("githubHost")
+    if raw is None:
+        # Kept for a single-host client; the current app sends a list.
+        credential, error = valid_credential({
+            "host": payload.get("host"),
+            "username": "x-access-token",
+            "token": payload.get("token"),
+        })
+        if error:
+            return None, error
+        credentials = [credential]
+        github_host = credential["host"]
+    elif isinstance(raw, list) and 1 <= len(raw) <= GIT_MAX_HOSTS:
+        credentials = []
+        for item in raw:
+            credential, error = valid_credential(item)
+            if error:
+                return None, error
+            credentials.append(credential)
+    else:
+        return None, "credentials must be a list of 1-%d host entries" % GIT_MAX_HOSTS
+
+    seen = set()
+    for credential in credentials:
+        if credential["host"] in seen:
+            return None, "each credential host may appear once"
+        seen.add(credential["host"])
+    if github_host is not None and github_host != "":
+        if not isinstance(github_host, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", github_host):
+            return None, "githubHost must be a hostname"
+        github_host = github_host.lower()
+        if github_host not in seen:
+            return None, "githubHost must name one of the supplied credentials"
+    else:
+        github_host = ""
+    return {"name": name, "email": email, "credentials": credentials,
+            "github_host": github_host}, ""
 
 
-def apply_git_setup(name, email, host, token):
-    """Write the credential helper and global git config for the console user."""
+def apply_git_setup(name, email, credentials, github_host):
+    """Write the helper, per-host credentials and global git config for the console user."""
     ctx = console_context()
     config_home = os.path.join(ctx["home"], ".config")
     directory = os.path.join(config_home, GIT_DIR[1])
+    credentials_dir = os.path.join(directory, GIT_CREDENTIALS_DIR)
+    secrets = [credential["token"] for credential in credentials]
     try:
         os.makedirs(config_home, mode=0o700, exist_ok=True)
         chown_user(ctx, config_home)
         os.makedirs(directory, mode=0o700, exist_ok=True)
         chown_user(ctx, directory)
-        write_user_file(ctx, os.path.join(directory, GIT_TOKEN_NAME), token + "\n", 0o600)
+        os.makedirs(credentials_dir, mode=0o700, exist_ok=True)
+        chown_user(ctx, credentials_dir)
         helper_path = os.path.join(directory, GIT_HELPER_NAME)
         write_user_file(ctx, helper_path, GIT_HELPER, 0o700)
+        for credential in credentials:
+            write_user_file(
+                ctx, os.path.join(credentials_dir, credential["host"]),
+                credential["username"] + "\n" + credential["token"] + "\n", 0o600)
     except OSError as error:
         raise GitSetupError("could not write %s: %s" % (directory, error))
 
     commands = [
         (["git", "config", "--global", "--replace-all", "user.name", name], True),
         (["git", "config", "--global", "--replace-all", "user.email", email], True),
-        (["git", "config", "--global",
-          "credential.https://%s.helper" % host, helper_path], True),
-        # Clearing first keeps a retry from stacking duplicate rewrite rules.
-        (["git", "config", "--global", "--unset-all",
-          "url.https://%s/.insteadOf" % host], False),
-        (["git", "config", "--global", "--add",
-          "url.https://%s/.insteadOf" % host, "git@%s:" % host], True),
-        (["git", "config", "--global", "--add",
-          "url.https://%s/.insteadOf" % host, "ssh://git@%s/" % host], True),
     ]
+    for credential in credentials:
+        host = credential["host"]
+        commands.extend([
+            (["git", "config", "--global",
+              "credential.https://%s.helper" % host, helper_path], True),
+            # Clearing first keeps a retry from stacking duplicate rewrite rules.
+            (["git", "config", "--global", "--unset-all",
+              "url.https://%s/.insteadOf" % host], False),
+            (["git", "config", "--global", "--add",
+              "url.https://%s/.insteadOf" % host, "git@%s:" % host], True),
+            (["git", "config", "--global", "--add",
+              "url.https://%s/.insteadOf" % host, "ssh://git@%s/" % host], True),
+        ])
     for command, required in commands:
         result = user_run(ctx, command, timeout=30)
         if not required or not result.returncode:
             continue
         line = (result.stderr or result.stdout).strip().splitlines()
         message = line[0] if line else "exit %s" % result.returncode
-        raise GitSetupError("git configuration failed: " + redact(message[:200], token))
+        for secret in secrets:
+            message = redact(message, secret)
+        raise GitSetupError("git configuration failed: " + message[:200])
 
     login = ""
-    probe = user_run(ctx, ["/bin/sh", "-c", "command -v gh"], timeout=10)
-    if probe.returncode == 0 and probe.stdout.strip():
-        login_result = user_run(
-            ctx, ["gh", "auth", "login", "--hostname", host, "--with-token"],
-            timeout=60, stdin_text=token + "\n")
-        if login_result.returncode:
-            # A locked or unavailable keychain is not a reason to leave gh signed out.
-            login_result = user_run(
-                ctx, ["gh", "auth", "login", "--hostname", host, "--with-token",
-                      "--insecure-storage"],
-                timeout=60, stdin_text=token + "\n")
-        if login_result.returncode:
-            line = (login_result.stderr or login_result.stdout).strip().splitlines()
-            message = line[0] if line else "exit %s" % login_result.returncode
-            raise GitSetupError(
-                "gh could not store the token: " + redact(message[:200], token))
-        api_result = user_run(
-            ctx, ["gh", "api", "--hostname", host, "user", "--jq", ".login"],
-            timeout=30, extra_env={"GH_TOKEN": token})
-        if api_result.returncode:
-            line = (api_result.stderr or api_result.stdout).strip().splitlines()
-            message = line[0] if line else "exit %s" % api_result.returncode
-            raise GitSetupError(
-                "the token was rejected: " + redact(message[:200], token))
-        login = api_result.stdout.strip()
-        if not login:
-            raise GitSetupError("the token did not resolve to a GitHub login")
+    github_error = ""
+    if github_host:
+        github = next(
+            (credential for credential in credentials if credential["host"] == github_host),
+            None)
+        probe = user_run(ctx, ["/bin/sh", "-c", "command -v gh"], timeout=10)
+        if github and probe.returncode == 0 and probe.stdout.strip():
+            api_result = user_run(
+                ctx, ["gh", "api", "--hostname", github_host, "user", "--jq", ".login"],
+                timeout=30, extra_env={"GH_TOKEN": github["token"]})
+            if api_result.returncode:
+                line = (api_result.stderr or api_result.stdout).strip().splitlines()
+                github_error = line[0] if line else "the token was rejected"
+                for secret in secrets:
+                    github_error = redact(github_error, secret)
+            else:
+                login = api_result.stdout.strip()
+            # Signing gh in is a convenience; a locked keychain must not discard a
+            # working Git credential or block another host.
+            if not github_error:
+                for insecure in (False, True):
+                    args = ["gh", "auth", "login", "--hostname", github_host,
+                            "--with-token"]
+                    if insecure:
+                        args.append("--insecure-storage")
+                    stored = user_run(ctx, args, timeout=15,
+                                      stdin_text=github["token"] + "\n")
+                    if stored.returncode == 0:
+                        break
 
-    # Prove the helper answers before the app calls Git configured.
-    fill = user_run(ctx, ["git", "credential", "fill"], timeout=30,
-                    stdin_text="protocol=https\nhost=%s\n\n" % host,
-                    extra_env={"GIT_TERMINAL_PROMPT": "0"})
-    password = ""
-    for line in fill.stdout.splitlines():
-        if line.startswith("password="):
-            password = line[len("password="):].strip()
-            break
-    if fill.returncode or not password:
-        raise GitSetupError("the credential helper did not return a password")
+    configured = []
+    failed = []
+    for credential in credentials:
+        fill = user_run(ctx, ["git", "credential", "fill"], timeout=30,
+                        stdin_text="protocol=https\nhost=%s\n\n" % credential["host"],
+                        extra_env={"GIT_TERMINAL_PROMPT": "0"})
+        username = ""
+        password = ""
+        for line in fill.stdout.splitlines():
+            if line.startswith("username="):
+                username = line[len("username="):].strip()
+            elif line.startswith("password="):
+                password = line[len("password="):].strip()
+        if credential["host"] == github_host and github_error:
+            failed.append({"host": credential["host"], "error": github_error})
+            continue
+        if fill.returncode or username != credential["username"] \
+                or password != credential["token"]:
+            failed.append({
+                "host": credential["host"],
+                "error": "the credential helper did not return the supplied credential",
+            })
+            continue
+        configured.append({
+            "host": credential["host"],
+            "login": login if credential["host"] == github_host else username,
+        })
 
-    marker = {"name": name, "email": email, "host": host, "login": login}
+    if not configured:
+        raise GitSetupError("no Git credential was accepted (%s)" % ", ".join(
+            entry["host"] for entry in failed))
+    primary = next(
+        (entry for entry in configured if entry["host"] == github_host), configured[0])
+    marker = {
+        "name": name,
+        "email": email,
+        "host": primary["host"],
+        "login": primary["login"],
+        "hosts": configured,
+    }
     try:
         write_user_file(ctx, os.path.join(directory, GIT_MARKER_NAME),
                         json.dumps(marker, indent=2, sort_keys=True) + "\n", 0o644)
+        try:
+            os.unlink(os.path.join(directory, GIT_LEGACY_TOKEN_NAME))
+        except OSError:
+            pass
     except OSError as error:
         raise GitSetupError("could not write the Git marker: %s" % error)
     with TOOLS_LOCK:
         TOOLS_CACHE[0] = 0.0
         TOOLS_CACHE[1] = {}
-    return {"ok": True, "name": name, "email": email, "host": host, "login": login,
-            "credential_helper": True}
+    return {"ok": True, "name": name, "email": email,
+            "host": primary["host"], "login": primary["login"],
+            "hosts": configured, "failed": failed, "credential_helper": True}
 
 
 def archive_problem(path):

@@ -728,10 +728,22 @@ function renderGitLine(session) {
 
 // -- desktop view -----------------------------------------------------------
 
+function canLoadDesktop(target, state) {
+  if (!target || !target.url) return false;
+  if (target.runId === state.session.runId) {
+    return state.session.light === 'ready' || state.session.light === 'amber';
+  }
+  const entry = state.sessions.find((item) => item.runId === target.runId);
+  if (!entry || !entry.readyAt) return false;
+  const run = state.runs.find((item) => Number(item.databaseId) === Number(target.runId));
+  return !run || run.status !== 'completed';
+}
+
 function renderDesktop() {
   const state = snapshot();
   const target = desktopTarget();
-  const url = target ? target.url : '';
+  const rawUrl = target ? target.url : '';
+  const loadable = canLoadDesktop(target, state);
   const light = state.session.light;
 
   const toolbar = target
@@ -744,21 +756,21 @@ function renderDesktop() {
   $('desktop-live').hidden = !target;
   $('desktop-run').textContent = target && target.runId ? `Run #${target.runId}` : '';
   $('desktop-time').textContent = desktopTime(target);
-  $('desktop-external').disabled = !url;
-  $('desktop-copy').disabled = !url;
+  $('desktop-external').disabled = !loadable;
+  $('desktop-copy').disabled = !loadable;
   $('desktop-stop').disabled = !(target && target.runId) || light === 'ended';
-  $('desktop-fullscreen').disabled = !url;
+  $('desktop-fullscreen').disabled = !loadable;
   $('desktop-fullscreen').lastElementChild.textContent = ui.fullscreen
     ? 'Exit fullscreen' : 'Fullscreen';
 
   const webview = $('desktop-webview');
-  const hasUrl = Boolean(url);
-  if (hasUrl && url !== ui.webviewUrl) loadWebview(url);
-  if (!hasUrl) {
+  if (!loadable) {
     webview.hidden = true;
-    $('desktop-empty').hidden = light === 'starting';
-    $('desktop-loading').hidden = light !== 'starting';
-    $('desktop-loading').querySelector('p').textContent = light === 'starting'
+    const connecting = light === 'starting' && Boolean(target)
+      && target.runId === state.session.runId;
+    $('desktop-empty').hidden = connecting;
+    $('desktop-loading').hidden = !connecting;
+    $('desktop-loading').querySelector('p').textContent = connecting
       ? 'Connecting to your Mac…' : '';
     $('desktop-retry').hidden = true;
     $('desktop-error').hidden = true;
@@ -766,6 +778,7 @@ function renderDesktop() {
     return;
   }
 
+  if (rawUrl !== ui.webviewUrl) loadWebview(rawUrl);
   webview.hidden = !ui.webviewLoaded;
   $('desktop-empty').hidden = true;
   const failed = Boolean(ui.webviewFailed);

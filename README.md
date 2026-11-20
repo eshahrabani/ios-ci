@@ -27,6 +27,19 @@ npm install
 npm start            # or ./run.sh
 ```
 
+On Linux, Electron needs either a root-owned setuid
+`node_modules/electron/dist/chrome-sandbox` or unprivileged user namespaces. When
+neither is available, `npm start`/`./run.sh` warn and launch with `--no-sandbox`.
+That is weaker than the sandbox; restore it once with:
+
+```bash
+sudo chown root:root node_modules/electron/dist/chrome-sandbox
+sudo chmod 4755 node_modules/electron/dist/chrome-sandbox
+```
+
+npm drops those permissions on a clean install, so repeat after reinstalling. Set
+`IOS_CI_REQUIRE_SANDBOX=1` to make the fallback an error instead.
+
 The setup wizard checks GitHub CLI, sign-in and scopes, Tailscale, the tailnet, the runner
 repository and its workflow, the Tailscale secret, and the Git identity. `Fix what I can`
 repairs everything except the auth key, which is the one value that cannot be derived

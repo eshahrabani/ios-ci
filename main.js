@@ -36,8 +36,21 @@ function denyPermissions(target) {
   target.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
 }
 
+function isDesktopUrl(url) {
+  try {
+    const parsed = new URL(String(url));
+    return parsed.protocol === 'http:' && parsed.port === '6080';
+  } catch {
+    return false;
+  }
+}
+
 function guardContents(contents) {
+  // The guest webview must be allowed to load the desktop it was created for; every
+  // other navigation is address-bar style and goes to the system browser instead.
+  const guest = contents.getType() === 'webview';
   contents.on('will-navigate', (event, url) => {
+    if (guest && isDesktopUrl(url)) return;
     event.preventDefault();
     openExternalUrl(url);
   });

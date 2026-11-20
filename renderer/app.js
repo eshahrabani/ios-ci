@@ -60,6 +60,7 @@ const ui = {
   webviewRetry: false,
   webviewTimer: null,
   hintShown: false,
+  hintTimer: null,
   fullscreen: false,
   transitionTimer: null,
   checksSignature: '',
@@ -773,7 +774,6 @@ function renderDesktop() {
   const loading = !ui.webviewLoaded && !failed;
   $('desktop-loading').hidden = !loading;
   $('desktop-retry').hidden = !(loading && ui.webviewRetry);
-  $('desktop-hint').hidden = !(ui.webviewLoaded && !ui.hintShown);
 }
 
 function desktopTarget() {
@@ -808,6 +808,8 @@ function loadWebview(url) {
   ui.webviewRetry = false;
   ui.hintShown = false;
   clearTimeout(ui.webviewTimer);
+  clearTimeout(ui.hintTimer);
+  $('desktop-hint').hidden = true;
   const webview = $('desktop-webview');
   webview.hidden = true;
   webview.src = url;
@@ -848,7 +850,8 @@ function wireWebview() {
     if (!ui.hintShown) {
       ui.hintShown = true;
       $('desktop-hint').hidden = false;
-      setTimeout(() => {
+      clearTimeout(ui.hintTimer);
+      ui.hintTimer = setTimeout(() => {
         $('desktop-hint').hidden = true;
       }, 3000);
     }
@@ -1322,7 +1325,9 @@ function wireEvents() {
       return;
     }
     if (command && event.key === 'Enter') {
-      if (ui.view === 'session' && snapshot().setup.complete && snapshot().session.light === 'idle') {
+      const current = snapshot();
+      const startable = current && ['idle', 'ended'].includes(current.session.light);
+      if (ui.view === 'session' && current.setup.complete && startable) {
         event.preventDefault();
         startSession();
       }

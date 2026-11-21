@@ -21,6 +21,14 @@ on:
         description: Lowercase hex SHA-256 of the session token
         required: true
         type: string
+      runner_arch:
+        description: macOS runner architecture
+        required: true
+        default: arm64
+        type: choice
+        options:
+          - arm64
+          - x64
 
 permissions:
   contents: read
@@ -34,12 +42,14 @@ concurrency:
 jobs:
   macos-desktop:
     name: macos-desktop
-    runs-on: macos-26
+    # macos-26 is the arm64 image; macos-26-intel is the x64 image.
+    runs-on: ${{ inputs.runner_arch == 'x64' && 'macos-26-intel' || 'macos-26' }}
     # GitHub caps hosted jobs at 360 minutes; the hold is at most 300 plus setup.
     timeout-minutes: 360
     env:
       SESSION_MINUTES: ${{ inputs.session_minutes }}
       SESSION_TOKEN_HASH: ${{ inputs.session_token_hash }}
+      RUNNER_ARCH: ${{ inputs.runner_arch }}
     steps:
       - name: Validate the session length
         run: |
@@ -58,8 +68,23 @@ jobs:
             echo "session_token_hash must be 64 hex characters (the SHA-256 of the session token), got ${#SESSION_TOKEN_HASH} characters"
             exit 1
           fi
+          case "$RUNNER_ARCH" in
+            arm64|x64) ;;
+            *)
+              echo "runner_arch must be arm64 or x64, got '$RUNNER_ARCH'"
+              exit 1
+              ;;
+          esac
+          # The label in runs-on is chosen from the input; prove the VM matches it so a
+          # mislabeled runner cannot start a session on the wrong architecture.
+          EXPECTED_ARCH=$([[ "$RUNNER_ARCH" == "x64" ]] && echo x86_64 || echo arm64)
+          HOST_ARCH=$(uname -m)
+          if [[ "$HOST_ARCH" != "$EXPECTED_ARCH" ]]; then
+            echo "runner_arch=$RUNNER_ARCH needs $EXPECTED_ARCH, but this runner is $HOST_ARCH"
+            exit 1
+          fi
           echo "SESSION_MINUTES=$MINUTES" >> "$GITHUB_ENV"
-          echo "session: ${MINUTES} minutes"
+          echo "session: ${MINUTES} minutes on ${RUNNER_ARCH} (${HOST_ARCH})"
 
       # The streamer is a Swift build against ScreenCaptureKit: ~25 s on this image,
       # and it only changes when bin/screen-stream.swift does. Keyed by commit so a

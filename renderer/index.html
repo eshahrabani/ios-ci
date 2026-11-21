@@ -121,6 +121,15 @@
             </div>
 
             <div class="card start-card" id="start-card">
+              <div class="vm-choice" id="arch" role="radiogroup" aria-label="macOS VM architecture">
+                <span class="vm-label">VM</span>
+                <button class="arch-pill" role="radio" aria-checked="true" data-arch="arm64">
+                  Apple Silicon <span class="arch-detail">arm64</span>
+                </button>
+                <button class="arch-pill" role="radio" aria-checked="false" data-arch="x64">
+                  Intel <span class="arch-detail">x64</span>
+                </button>
+              </div>
               <div class="duration" id="duration" role="radiogroup" aria-label="Session length">
                 <button class="duration-pill" role="radio" aria-checked="false" data-minutes="15">15m</button>
                 <button class="duration-pill" role="radio" aria-checked="true" data-minutes="30">30m</button>

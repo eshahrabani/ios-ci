@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Provision the ios-ci VM: Xcode, an iOS runtime, a booted iPhone simulator, Node.js,
-# Yarn 4 and Git. Idempotent; every assertion fails loudly. The app reads the facts it
-# leaves in /tmp/ios-ci-env.json through the desktop server's /stats.
+# Provision the ios-ci VM: Xcode, an iOS runtime, an iPhone simulator, Node.js, Yarn 4
+# and Git. The simulator is created but never booted; the tester launches it on demand.
+# Idempotent; every assertion fails loudly. The app reads the facts it leaves in
+# /tmp/ios-ci-env.json through the desktop server's /stats.
 #
 # Usage: bin/vm-provision.sh [logfile]
 set -euo pipefail
@@ -73,28 +74,38 @@ RUNTIME_VERSION=$(xcrun simctl list runtimes -j | jq -r --arg r "$RUNTIME" '
 log "iOS runtime: ${RUNTIME_VERSION} (${RUNTIME})"
 
 # 3. Simulator ---------------------------------------------------------------
+# A device must exist for the selected runtime, but it stays shut down: booting or
+# opening Simulator.app is the tester's choice once the desktop is handed over.
 UDID=$(xcrun simctl list devices available -j | jq -r --arg r "$RUNTIME" '
   .devices[$r] // []
   | (map(select(.name == "iPhone 17 Pro")) + map(select(.name | startswith("iPhone"))))
   | (map(select(.udid)) | .[0].udid) // empty')
-[[ -n "$UDID" ]] || fail "no iPhone simulator is available in ${RUNTIME}"
-SIMULATOR_NAME=$(xcrun simctl list devices -j | jq -r --arg u "$UDID" '
-  .devices[][] | select(.udid == $u) | .name' | head -1)
-log "booting simulator ${SIMULATOR_NAME} (${UDID})"
-
-# "boot" fails when the device is already booted; that is the idempotent case.
-xcrun simctl boot "$UDID" >/dev/null 2>&1 || true
-xcrun simctl bootstatus "$UDID" -b || fail "simulator ${UDID} did not finish booting"
+if [[ -z "$UDID" ]]; then
+  DEVICE_TYPE=$(xcrun simctl list devicetypes -j | jq -r '
+    [.devicetypes[] | select(.name | startswith("iPhone"))]
+    | (map(select(.name == "iPhone 17 Pro")) + .)
+    | .[0].identifier // empty')
+  DEVICE_NAME=$(xcrun simctl list devicetypes -j | jq -r --arg id "$DEVICE_TYPE" '
+    .devicetypes[] | select(.identifier == $id) | .name')
+  [[ -n "$DEVICE_TYPE" && -n "$DEVICE_NAME" ]] \
+    || fail "no iPhone simulator device type is installed"
+  UDID=$(xcrun simctl create "$DEVICE_NAME" "$DEVICE_TYPE" "$RUNTIME") \
+    || fail "could not create an iPhone simulator in ${RUNTIME}"
+  [[ -n "$UDID" ]] || fail "simctl create returned no device id"
+  SIMULATOR_NAME=$DEVICE_NAME
+  log "created simulator ${SIMULATOR_NAME} (${UDID})"
+else
+  SIMULATOR_NAME=$(xcrun simctl list devices -j | jq -r --arg u "$UDID" '
+    .devices[][] | select(.udid == $u) | .name' | head -1)
+fi
 STATE=$(xcrun simctl list devices -j | jq -r --arg u "$UDID" '
   .devices[][] | select(.udid == $u) | .state' | head -1)
-[[ "$STATE" == "Booted" ]] || fail "simulator ${UDID} is ${STATE:-unknown}, not Booted"
-log "simulator state: ${STATE}"
-
-# Best effort: put the Simulator window on the streamed desktop.
-SIMULATOR_APP="$(xcode-select -p)/Applications/Simulator.app"
-sudo -n launchctl asuser "$CONSOLE_UID" sudo -u "$CONSOLE_USER" \
-  open -a "$SIMULATOR_APP" >/dev/null 2>&1 \
-  || log "warning: could not open Simulator.app for ${CONSOLE_USER}"
+[[ -n "$STATE" ]] || fail "could not read the state of simulator ${UDID}"
+SIMULATOR_BOOTED=false
+if [[ "$STATE" == "Booted" ]]; then
+  SIMULATOR_BOOTED=true
+fi
+log "simulator ${SIMULATOR_NAME} (${UDID}) is ${STATE}; boot it from the desktop when needed"
 
 # 4. Node --------------------------------------------------------------------
 if ! command -v node >/dev/null 2>&1; then
@@ -159,6 +170,7 @@ jq -n \
   --arg ios_runtime "$RUNTIME_VERSION" \
   --arg simulator "$SIMULATOR_NAME" \
   --arg simulator_udid "$UDID" \
+  --argjson simulator_booted "$SIMULATOR_BOOTED" \
   --arg node "$NODE_VERSION" \
   --arg yarn "$YARN_VERSION" \
   --arg git "$GIT_VERSION" \
@@ -168,7 +180,7 @@ jq -n \
     ios_runtime: $ios_runtime,
     simulator: $simulator,
     simulator_udid: $simulator_udid,
-    simulator_booted: true,
+    simulator_booted: $simulator_booted,
     node: $node,
     yarn: $yarn,
     git: $git
@@ -181,7 +193,7 @@ log "xcode_path=${XCODE_PATH}"
 log "ios_runtime=${RUNTIME_VERSION}"
 log "simulator=${SIMULATOR_NAME}"
 log "simulator_udid=${UDID}"
-log "simulator_booted=true"
+log "simulator_booted=${SIMULATOR_BOOTED}"
 log "node=${NODE_VERSION}"
 log "yarn=${YARN_VERSION}"
 log "git=${GIT_VERSION}"

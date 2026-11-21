@@ -56,6 +56,27 @@ test('git-setup separates the session token from host credentials', async () => 
   }
 });
 
+test('dispatch sends the selected VM architecture', async () => {
+  for (const arch of ['arm64', 'x64']) {
+    const backend = new Backend('owner/repo');
+    backend.newestRunId = async () => 0;
+    const calls = [];
+    let correlation = '';
+    backend.gh = async (args) => {
+      calls.push(args);
+      if (args[0] === 'workflow') {
+        correlation = args.find((arg) => arg.startsWith('correlation_id='))
+          .slice('correlation_id='.length);
+        return '';
+      }
+      return JSON.stringify([{ databaseId: 42, displayTitle: `ios-ci ${correlation}` }]);
+    };
+    const runId = await backend.dispatch(30, 'a'.repeat(64), arch);
+    assert.equal(runId, 42);
+    assert.ok(calls[0].includes(`runner_arch=${arch}`));
+  }
+});
+
 test('credential parsing keeps an equals sign in the password', () => {
   assert.deepEqual(parseCredential('username=ada\npassword=abc=def\n'), {
     username: 'ada', password: 'abc=def',

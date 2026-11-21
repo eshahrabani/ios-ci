@@ -52,6 +52,24 @@ test('only the 20 newest numeric sessions are kept', () => {
     21, 22, 23, 24, 25]);
 });
 
+test('the VM architecture defaults to arm64 and rejects unknown values', () => {
+  assert.equal(defaults().arch, 'arm64');
+  assert.equal(sanitizeSettings({}).arch, 'arm64');
+  assert.equal(sanitizeSettings({ arch: 'x64' }).arch, 'x64');
+  assert.equal(sanitizeSettings({ arch: 'ppc' }).arch, 'arm64');
+});
+
+test('session entries keep a known architecture', () => {
+  const settings = sanitizeSettings({
+    sessions: {
+      12: { token: 't', arch: 'x64' },
+      13: { token: 't', arch: 'ppc' },
+    },
+  });
+  assert.equal(settings.sessions['12'].arch, 'x64');
+  assert.equal(settings.sessions['13'].arch, '');
+});
+
 test('lastRunId is numeric or null', () => {
   assert.equal(sanitizeSettings({ lastRunId: 4242 }).lastRunId, 4242);
   assert.equal(sanitizeSettings({ lastRunId: 'nope' }).lastRunId, null);

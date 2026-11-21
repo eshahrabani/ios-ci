@@ -7,9 +7,10 @@ joins your tailnet, serves its screen to a browser page, injects your clicks and
 and holds the VM for the minutes you asked for. The local client is an Electron app with
 a setup wizard, one-click sessions, history, and the streamed desktop in a window.
 
-Every booted VM is provisioned before the desktop is served: Xcode, an iOS runtime with a
-booted iPhone simulator, Node.js, Yarn 4 and Git. Your Git name, email and Git
-credentials are installed too, so a private clone works immediately.
+Every booted VM is provisioned before the desktop is served: Xcode, an iOS runtime and an
+iPhone simulator, Node.js, Yarn 4 and Git. Your Git name, email and Git credentials are
+installed too, so a private clone works immediately. The simulator is set up but left
+shut down; launch it when you need it.
 
 ## Requirements
 
@@ -55,6 +56,10 @@ repository; `IOS_CI_REF` dispatches a branch instead of `main`.
 
 ## The session
 
+* The VM is macOS 26 on Apple Silicon (`arm64`, the default) or Intel (`x64`). The choice
+  is saved in the settings file and dispatched as `runner_arch`.
+* An iPhone simulator is created for the newest iOS runtime but is not booted. Launch it
+  in the VM with Simulator.app or `xcrun simctl boot <udid>` when you want it.
 * The duration is 15, 30, 60 or 120 minutes, or 1–300 custom. The clock starts when the
   desktop is ready, not at dispatch.
 * The app polls `gh` and the runner's `/stats`, and turns green only when frames, input,

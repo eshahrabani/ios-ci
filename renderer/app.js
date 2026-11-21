@@ -8,6 +8,7 @@ const TAILSCALE_INSTALL = 'https://tailscale.com/download';
 const TAILSCALE_KEYS = 'https://login.tailscale.com/admin/settings/keys';
 const GH_DEVICE = 'https://github.com/login/device';
 const PRESETS = [15, 30, 60, 120];
+const ARCHES = ['arm64', 'x64'];
 
 const ICON_PATHS = {
   play: '<path d="M8.5 5.5v13L18 12z"/>',
@@ -72,6 +73,12 @@ const ui = {
   savedTimer: null,
   focusKey: false,
 };
+
+function archLabel(arch) {
+  if (arch === 'arm64') return 'Apple Silicon';
+  if (arch === 'x64') return 'Intel';
+  return '';
+}
 
 function shortDuration(value) {
   const total = Math.round(Number(value) || 0);
@@ -515,6 +522,12 @@ function renderSessionMain() {
   $('start-error').textContent = ui.startError || session.error || '';
   $('start-repo').textContent = state.settings.runnerRepo;
 
+  const selectedArch = ARCHES.includes(state.settings.arch) ? state.settings.arch : 'arm64';
+  for (const pill of document.querySelectorAll('.arch-pill')) {
+    const selected = pill.dataset.arch === selectedArch;
+    pill.setAttribute('aria-checked', String(selected));
+    pill.tabIndex = selected ? 0 : -1;
+  }
   for (const pill of document.querySelectorAll('.duration-pill')) {
     const preset = Number(pill.dataset.minutes);
     const selected = ui.custom
@@ -549,7 +562,10 @@ function renderSessionMain() {
   const [statusText, statusState] = statusMap[light] || statusMap.starting;
   $('session-status-text').textContent = statusText;
   $('session-status').dataset.state = statusState;
-  $('session-run').textContent = session.runId ? `Run #${session.runId}` : '';
+  const arch = archLabel(session.arch);
+  $('session-run').textContent = session.runId
+    ? `Run #${session.runId}${arch ? ` · ${arch}` : ''}`
+    : '';
   $('session-cancel').hidden = light === 'ended';
   $('session-cancel').disabled = !session.runId;
   $('session-phase').textContent = session.phase || 'Starting';
@@ -660,7 +676,7 @@ function renderChips(session) {
   const tools = session.tools || {};
   const hasFacts = Object.keys(tools).length > 0;
   const signature = JSON.stringify([hasFacts, tools.xcode, tools.ios_runtime,
-    tools.simulator, tools.simulator_booted, tools.node, tools.yarn, tools.git]);
+    tools.simulator, tools.simulator_udid, tools.node, tools.yarn, tools.git]);
   if (signature === ui.chipsSignature) return;
   ui.chipsSignature = signature;
   const box = $('session-chips');
@@ -677,10 +693,11 @@ function renderChips(session) {
     return node;
   };
   box.appendChild(chip('Xcode', tools.xcode || 'missing', Boolean(tools.xcode)));
-  const runtime = tools.simulator_booted
-    ? `booted${tools.ios_runtime ? ` · ${tools.ios_runtime}` : ''}`
-    : 'not booted';
-  box.appendChild(chip('iOS simulator', runtime, Boolean(tools.simulator_booted)));
+  const simulatorReady = Boolean(tools.simulator_udid);
+  const runtime = simulatorReady
+    ? `installed${tools.ios_runtime ? ` · ${tools.ios_runtime}` : ''}`
+    : 'not set up';
+  box.appendChild(chip('iOS simulator', runtime, simulatorReady));
   box.appendChild(chip('Node', tools.node || 'missing', Boolean(tools.node)));
   const yarnOk = /^4\./.test(tools.yarn || '');
   box.appendChild(chip('Yarn', tools.yarn || 'missing', yarnOk));
@@ -913,6 +930,7 @@ function runStatus(run, entry) {
 function rowMeta(run, entry) {
   const parts = [];
   if (entry && entry.minutes) parts.push(`${entry.minutes} min`);
+  if (entry && archLabel(entry.arch)) parts.push(archLabel(entry.arch));
   const started = hhmm(run.startedAt || run.createdAt);
   if (started) parts.push(`started ${started}`);
   if (run.status !== 'completed') {
@@ -1103,6 +1121,15 @@ function openCurrentDesktop() {
   setView('desktop');
 }
 
+async function selectArch(arch) {
+  if (!ARCHES.includes(arch)) return;
+  const state = snapshot();
+  if (!state || state.settings.arch === arch) return;
+  applyState({ ...state, settings: { ...state.settings, arch } });
+  const saved = await api.saveSettings({ arch });
+  if (saved) applyState(saved);
+}
+
 function selectDuration(minutes, custom) {
   ui.custom = Boolean(custom);
   if (custom) {
@@ -1137,6 +1164,7 @@ async function startSession() {
   renderSessionMain();
   const request = {
     minutes,
+    arch: ARCHES.includes(state.settings.arch) ? state.settings.arch : 'arm64',
     copyDir: $('copy-dir').value.trim(),
     copyName: $('copy-name').value.trim(),
     excludeDefaults: $('copy-excludes').checked,
@@ -1188,6 +1216,31 @@ async function copyNow() {
   renderSessionMain();
 }
 
+function wireRadioGroup(group, select) {
+  group.addEventListener('click', (event) => {
+    const pill = event.target.closest('[role="radio"]');
+    if (!pill || !group.contains(pill)) return;
+    select(pill);
+  });
+  group.addEventListener('keydown', (event) => {
+    const keys = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'];
+    if (!keys.includes(event.key)) return;
+    event.preventDefault();
+    const pills = Array.from(group.querySelectorAll('[role="radio"]'));
+    const current = pills.indexOf(document.activeElement);
+    let next = current < 0 ? 0 : current;
+    if (event.key === 'Home') next = 0;
+    else if (event.key === 'End') next = pills.length - 1;
+    else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      next = (current + 1 + pills.length) % pills.length;
+    } else {
+      next = (current - 1 + pills.length) % pills.length;
+    }
+    pills[next].focus();
+    pills[next].click();
+  });
+}
+
 function wireEvents() {
   document.querySelectorAll('.nav-item').forEach((item) => {
     item.addEventListener('click', () => setView(item.dataset.view, { fromNav: true }));
@@ -1214,29 +1267,10 @@ function wireEvents() {
     renderWizard();
   });
 
-  const duration = $('duration');
-  duration.addEventListener('click', (event) => {
-    const pill = event.target.closest('.duration-pill');
-    if (!pill) return;
+  wireRadioGroup($('arch'), (pill) => selectArch(pill.dataset.arch));
+  wireRadioGroup($('duration'), (pill) => {
     if (pill.dataset.custom) selectDuration(null, true);
     else selectDuration(Number(pill.dataset.minutes), false);
-  });
-  duration.addEventListener('keydown', (event) => {
-    const keys = ['ArrowRight', 'ArrowDown', 'ArrowLeft', 'ArrowUp', 'Home', 'End'];
-    if (!keys.includes(event.key)) return;
-    event.preventDefault();
-    const pills = Array.from(duration.querySelectorAll('.duration-pill'));
-    const current = pills.indexOf(document.activeElement);
-    let next = current < 0 ? 0 : current;
-    if (event.key === 'Home') next = 0;
-    else if (event.key === 'End') next = pills.length - 1;
-    else if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
-      next = (current + 1 + pills.length) % pills.length;
-    } else {
-      next = (current - 1 + pills.length) % pills.length;
-    }
-    pills[next].focus();
-    pills[next].click();
   });
   $('custom-minutes-input').addEventListener('input', () => {
     ui.custom = true;

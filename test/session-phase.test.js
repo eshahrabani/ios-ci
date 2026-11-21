@@ -1,9 +1,24 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { desktopPhase } = require('../lib/session');
+const { desktopPhase, toolchainReady } = require('../lib/session');
 
 const LIVE = { light: 'starting', live: true, toolchainOk: true, gitState: 'pending' };
+const TOOLS = {
+  xcode: '26.0',
+  ios_runtime: '26.0',
+  simulator_udid: 'ABC-123',
+  simulator_booted: false,
+  node: 'v22.11.0',
+  yarn: '4.18.1',
+};
+
+test('a shut-down simulator still completes the toolchain', () => {
+  assert.equal(toolchainReady(TOOLS), true);
+  assert.equal(toolchainReady({ ...TOOLS, simulator_booted: true }), true);
+  assert.equal(toolchainReady({ ...TOOLS, simulator_udid: '' }), false);
+  assert.equal(toolchainReady({ ...TOOLS, ios_runtime: '' }), false);
+});
 
 test('a live desktop never keeps an earlier workflow phase', () => {
   assert.equal(desktopPhase(LIVE), 'Desktop available');
